@@ -40,7 +40,18 @@ class QuestionIn(BaseModel):
 class QuizIn(BaseModel):
     title: str = Field(min_length=1, max_length=200)
     course_tag: str = Field(default="", max_length=80)
+    folder_id: int | None = None
     questions: list[QuestionIn] = Field(default_factory=list)
+
+
+class FolderIn(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    course_tag: str = Field(default="", max_length=80)
+    description: str = Field(default="", max_length=500)
+
+
+class FolderMemberIn(BaseModel):
+    email: EmailStr
 
 
 class JoinIn(BaseModel):
@@ -59,4 +70,3 @@ class SessionOut(BaseModel):
     is_revealed: bool
     started_at: datetime | None
     ended_at: datetime | None
-

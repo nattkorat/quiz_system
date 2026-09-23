@@ -1,7 +1,6 @@
 import base64
 import hashlib
 import hmac
-import os
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -11,10 +10,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from .database import get_db
+from .config import JWT_SECRET
 from .models import User
 
 
-JWT_SECRET = os.getenv("JWT_SECRET", "dev-only-change-me")
 JWT_ALGORITHM = "HS256"
 bearer = HTTPBearer(auto_error=False)
 
@@ -53,4 +52,3 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
-

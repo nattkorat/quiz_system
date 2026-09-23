@@ -20,6 +20,33 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     password_hash: Mapped[str] = mapped_column(String(512))
     quizzes: Mapped[list[Quiz]] = relationship(back_populates="owner", cascade="all, delete-orphan")
+    folders_owned: Mapped[list[CourseFolder]] = relationship(back_populates="owner", cascade="all, delete-orphan")
+    folder_memberships: Mapped[list[FolderMember]] = relationship(back_populates="user", cascade="all, delete-orphan")
+
+
+class CourseFolder(Base):
+    __tablename__ = "course_folders"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    course_tag: Mapped[str] = mapped_column(String(80), default="")
+    description: Mapped[str] = mapped_column(String(500), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    owner: Mapped[User] = relationship(back_populates="folders_owned")
+    members: Mapped[list[FolderMember]] = relationship(back_populates="folder", cascade="all, delete-orphan")
+    quizzes: Mapped[list[Quiz]] = relationship(back_populates="folder")
+
+
+class FolderMember(Base):
+    __tablename__ = "folder_members"
+    __table_args__ = (Index("idx_folder_member_user_folder", "user_id", "folder_id"),)
+
+    folder_id: Mapped[int] = mapped_column(ForeignKey("course_folders.id"), primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), primary_key=True)
+    joined_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    folder: Mapped[CourseFolder] = relationship(back_populates="members")
+    user: Mapped[User] = relationship(back_populates="folder_memberships")
 
 
 class Quiz(Base):
@@ -27,10 +54,13 @@ class Quiz(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     owner_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    folder_id: Mapped[int | None] = mapped_column(ForeignKey("course_folders.id"), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(200))
     course_tag: Mapped[str] = mapped_column(String(80), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
     owner: Mapped[User] = relationship(back_populates="quizzes")
+    folder: Mapped[CourseFolder | None] = relationship(back_populates="quizzes")
     questions: Mapped[list[Question]] = relationship(
         back_populates="quiz", cascade="all, delete-orphan", order_by="Question.position"
     )
@@ -57,6 +87,7 @@ class GameSession(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     quiz_id: Mapped[int] = mapped_column(ForeignKey("quizzes.id"), index=True)
+    host_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     pin: Mapped[str] = mapped_column(String(6), unique=True, index=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     current_question_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -66,6 +97,7 @@ class GameSession(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     quiz: Mapped[Quiz] = relationship()
+    host: Mapped[User | None] = relationship()
     participants: Mapped[list[Participant]] = relationship(back_populates="session", cascade="all, delete-orphan")
 
 

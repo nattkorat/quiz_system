@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
-import os
 import random
 import secrets
 from contextlib import asynccontextmanager
@@ -12,37 +12,68 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response, WebSocket,
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, inspect, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from .auth import create_token, current_user, decode_user_id, hash_password, verify_password
+from .config import CORS_ORIGINS, DEFAULT_INSTRUCTOR_EMAIL, DEFAULT_INSTRUCTOR_NAME, DEFAULT_INSTRUCTOR_PASSWORD, RESULT_DISPLAY_SECONDS
 from .database import Base, SessionLocal, engine, get_db
-from .models import Answer, GameSession, Participant, Question, Quiz, User, utcnow
+from .models import Answer, CourseFolder, FolderMember, GameSession, Participant, Question, Quiz, User, utcnow
 from .realtime import Client, manager
-from .schemas import JoinIn, LoginIn, QuizIn, RegisterIn
-from .services import answer_distribution, leaderboard, question_payload, reveal_payload, session_snapshot
+from .schemas import FolderIn, FolderMemberIn, JoinIn, LoginIn, QuizIn, RegisterIn
+from .services import answer_distribution, iso, leaderboard, question_payload, reveal_payload, session_snapshot
 
 
 def initialize_database():
     Base.metadata.create_all(engine)
-    email = os.getenv("DEFAULT_INSTRUCTOR_EMAIL", "instructor@example.com").lower()
-    password = os.getenv("DEFAULT_INSTRUCTOR_PASSWORD", "change-me-123")
+    schema = inspect(engine)
+    quiz_columns = {column["name"] for column in schema.get_columns("quizzes")}
+    session_columns = {column["name"] for column in schema.get_columns("sessions")}
+    with engine.begin() as connection:
+        if "folder_id" not in quiz_columns:
+            connection.execute(text("ALTER TABLE quizzes ADD COLUMN folder_id INTEGER"))
+        if "deleted_at" not in quiz_columns:
+            connection.execute(text("ALTER TABLE quizzes ADD COLUMN deleted_at DATETIME"))
+        if "host_id" not in session_columns:
+            connection.execute(text("ALTER TABLE sessions ADD COLUMN host_id INTEGER"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS idx_quizzes_folder_id ON quizzes (folder_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS idx_quizzes_deleted_at ON quizzes (deleted_at)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS idx_sessions_host_id ON sessions (host_id)"))
+        connection.execute(text("UPDATE sessions SET host_id = (SELECT owner_id FROM quizzes WHERE quizzes.id = sessions.quiz_id) WHERE host_id IS NULL"))
+        if engine.dialect.name == "sqlite":
+            connection.execute(text("PRAGMA optimize"))
     with SessionLocal() as db:
-        if not db.scalar(select(User).where(User.email == email)):
-            db.add(User(name="Course Instructor", email=email, password_hash=hash_password(password)))
+        if not db.scalar(select(User).where(User.email == DEFAULT_INSTRUCTOR_EMAIL)):
+            db.add(User(name=DEFAULT_INSTRUCTOR_NAME, email=DEFAULT_INSTRUCTOR_EMAIL, password_hash=hash_password(DEFAULT_INSTRUCTOR_PASSWORD)))
             db.commit()
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     initialize_database()
+    with SessionLocal() as db:
+        active = db.scalars(
+            select(GameSession)
+            .where(GameSession.status == "live")
+            .options(selectinload(GameSession.quiz).selectinload(Quiz.questions))
+        ).all()
+        for game in active:
+            if game.current_question_index is None:
+                continue
+            question = game.quiz.questions[game.current_question_index]
+            if game.is_revealed:
+                schedule_advance(game.id, question.id)
+            else:
+                remaining = max(0.0, ((game.question_deadline_at or utcnow()) - utcnow()).total_seconds())
+                schedule_reveal(game.id, question.id, remaining)
     yield
+    for session_id, _name in list(manager.tasks):
+        manager.cancel_session_tasks(session_id)
 
 
 app = FastAPI(title="QuizForge API", version="1.0.0", lifespan=lifespan)
-origins = os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",")
-app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/api/health")
@@ -69,21 +100,89 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
     return {"access_token": create_token(user), "user": {"id": user.id, "name": user.name, "email": user.email}}
 
 
-def serialize_quiz(quiz: Quiz, include_answers: bool = True) -> dict:
+def serialize_quiz(quiz: Quiz, include_answers: bool = True, viewer_id: int | None = None) -> dict:
     questions = []
     for q in quiz.questions:
         item = {"id": q.id, "position": q.position, "text": q.text, "type": q.type, "options": q.options, "time_limit_sec": q.time_limit_sec, "points": q.points}
         if include_answers:
             item["correct_options"] = q.correct_options
         questions.append(item)
-    return {"id": quiz.id, "title": quiz.title, "course_tag": quiz.course_tag, "created_at": quiz.created_at, "questions": questions}
+    return {
+        "id": quiz.id,
+        "title": quiz.title,
+        "course_tag": quiz.course_tag,
+        "created_at": quiz.created_at,
+        "questions": questions,
+        "owner": {"id": quiz.owner.id, "name": quiz.owner.name, "email": quiz.owner.email},
+        "folder": {"id": quiz.folder.id, "name": quiz.folder.name, "course_tag": quiz.folder.course_tag} if quiz.folder else None,
+        "can_edit": viewer_id == quiz.owner_id if viewer_id else False,
+    }
 
 
 def owned_quiz(db: Session, quiz_id: int, user_id: int) -> Quiz:
-    quiz = db.scalar(select(Quiz).where(Quiz.id == quiz_id, Quiz.owner_id == user_id).options(selectinload(Quiz.questions)))
+    quiz = db.scalar(
+        select(Quiz)
+        .where(Quiz.id == quiz_id, Quiz.owner_id == user_id, Quiz.deleted_at.is_(None))
+        .options(selectinload(Quiz.questions), selectinload(Quiz.owner), selectinload(Quiz.folder))
+    )
     if not quiz:
         raise HTTPException(404, "Quiz not found")
     return quiz
+
+
+def accessible_folder(db: Session, folder_id: int, user_id: int, owner_only: bool = False) -> CourseFolder:
+    query = (
+        select(CourseFolder)
+        .where(CourseFolder.id == folder_id)
+        .options(
+            selectinload(CourseFolder.owner),
+            selectinload(CourseFolder.members).selectinload(FolderMember.user),
+            selectinload(CourseFolder.quizzes),
+        )
+    )
+    if owner_only:
+        query = query.where(CourseFolder.owner_id == user_id)
+    else:
+        member_folders = select(FolderMember.folder_id).where(FolderMember.user_id == user_id)
+        query = query.where(or_(CourseFolder.owner_id == user_id, CourseFolder.id.in_(member_folders)))
+    folder = db.scalar(query)
+    if not folder:
+        raise HTTPException(404, "Course folder not found")
+    return folder
+
+
+def accessible_quiz(db: Session, quiz_id: int, user_id: int) -> Quiz:
+    member_folders = select(FolderMember.folder_id).where(FolderMember.user_id == user_id)
+    quiz = db.scalar(
+        select(Quiz)
+        .where(
+            Quiz.id == quiz_id,
+            Quiz.deleted_at.is_(None),
+            or_(
+                Quiz.owner_id == user_id,
+                Quiz.folder.has(CourseFolder.owner_id == user_id),
+                Quiz.folder_id.in_(member_folders),
+            ),
+        )
+        .options(selectinload(Quiz.questions), selectinload(Quiz.owner), selectinload(Quiz.folder))
+    )
+    if not quiz:
+        raise HTTPException(404, "Quiz not found")
+    return quiz
+
+
+def serialize_folder(folder: CourseFolder, viewer_id: int) -> dict:
+    return {
+        "id": folder.id,
+        "name": folder.name,
+        "course_tag": folder.course_tag,
+        "description": folder.description,
+        "created_at": folder.created_at,
+        "owner": {"id": folder.owner.id, "name": folder.owner.name, "email": folder.owner.email},
+        "is_owner": folder.owner_id == viewer_id,
+        "quiz_count": sum(1 for quiz in folder.quizzes if quiz.deleted_at is None),
+        "members": [{"id": membership.user.id, "name": membership.user.name, "email": membership.user.email} for membership in folder.members],
+    }
 
 
 def validate_quiz(body: QuizIn):
@@ -95,45 +194,142 @@ def validate_quiz(body: QuizIn):
             raise HTTPException(422, f"Question {index + 1} must have exactly one correct option")
 
 
+@app.get("/api/instructors")
+def list_instructors(search: str = "", user: User = Depends(current_user), db: Session = Depends(get_db)):
+    query = select(User).where(User.id != user.id)
+    if search.strip():
+        term = f"%{search.strip().lower()}%"
+        query = query.where(or_(func.lower(User.name).like(term), func.lower(User.email).like(term)))
+    instructors = db.scalars(query.order_by(User.name).limit(20)).all()
+    return [{"id": instructor.id, "name": instructor.name, "email": instructor.email} for instructor in instructors]
+
+
+@app.get("/api/folders")
+def list_folders(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    member_folders = select(FolderMember.folder_id).where(FolderMember.user_id == user.id)
+    folders = db.scalars(
+        select(CourseFolder)
+        .where(or_(CourseFolder.owner_id == user.id, CourseFolder.id.in_(member_folders)))
+        .options(
+            selectinload(CourseFolder.owner),
+            selectinload(CourseFolder.members).selectinload(FolderMember.user),
+            selectinload(CourseFolder.quizzes),
+        )
+        .order_by(CourseFolder.name)
+    ).all()
+    return [serialize_folder(folder, user.id) for folder in folders]
+
+
+@app.post("/api/folders", status_code=201)
+def create_folder(body: FolderIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    folder = CourseFolder(owner_id=user.id, name=body.name.strip(), course_tag=body.course_tag.strip(), description=body.description.strip())
+    db.add(folder)
+    db.commit()
+    return serialize_folder(accessible_folder(db, folder.id, user.id), user.id)
+
+
+@app.put("/api/folders/{folder_id}")
+def update_folder(folder_id: int, body: FolderIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    folder = accessible_folder(db, folder_id, user.id, owner_only=True)
+    folder.name, folder.course_tag, folder.description = body.name.strip(), body.course_tag.strip(), body.description.strip()
+    db.commit()
+    return serialize_folder(accessible_folder(db, folder.id, user.id), user.id)
+
+
+@app.delete("/api/folders/{folder_id}", status_code=204)
+def delete_folder(folder_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    folder = accessible_folder(db, folder_id, user.id, owner_only=True)
+    for quiz in folder.quizzes:
+        quiz.folder_id = None
+    db.flush()
+    db.delete(folder)
+    db.commit()
+
+
+@app.post("/api/folders/{folder_id}/members", status_code=201)
+def add_folder_member(folder_id: int, body: FolderMemberIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    folder = accessible_folder(db, folder_id, user.id, owner_only=True)
+    member = db.scalar(select(User).where(User.email == body.email.lower()))
+    if not member:
+        raise HTTPException(404, "Instructor must create an account before being invited")
+    if member.id == user.id:
+        raise HTTPException(409, "Folder owner already has access")
+    if db.get(FolderMember, (folder.id, member.id)):
+        raise HTTPException(409, "Instructor already has access")
+    db.add(FolderMember(folder_id=folder.id, user_id=member.id))
+    db.commit()
+    return serialize_folder(accessible_folder(db, folder.id, user.id), user.id)
+
+
+@app.delete("/api/folders/{folder_id}/members/{member_id}", status_code=204)
+def remove_folder_member(folder_id: int, member_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    folder = accessible_folder(db, folder_id, user.id, owner_only=True)
+    membership = db.get(FolderMember, (folder.id, member_id))
+    if not membership:
+        raise HTTPException(404, "Folder member not found")
+    db.delete(membership)
+    db.commit()
+
+
 @app.get("/api/quizzes")
-def list_quizzes(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    quizzes = db.scalars(select(Quiz).where(Quiz.owner_id == user.id).options(selectinload(Quiz.questions)).order_by(Quiz.created_at.desc())).all()
-    return [serialize_quiz(q) for q in quizzes]
+def list_quizzes(search: str = "", user: User = Depends(current_user), db: Session = Depends(get_db)):
+    member_folders = select(FolderMember.folder_id).where(FolderMember.user_id == user.id)
+    query = (
+        select(Quiz)
+        .join(Quiz.owner)
+        .where(Quiz.deleted_at.is_(None), or_(Quiz.owner_id == user.id, Quiz.folder.has(CourseFolder.owner_id == user.id), Quiz.folder_id.in_(member_folders)))
+        .options(selectinload(Quiz.questions), selectinload(Quiz.owner), selectinload(Quiz.folder))
+    )
+    if search.strip():
+        term = f"%{search.strip().lower()}%"
+        query = query.where(or_(func.lower(Quiz.title).like(term), func.lower(Quiz.course_tag).like(term), func.lower(User.name).like(term)))
+    quizzes = db.scalars(query.order_by(Quiz.created_at.desc())).unique().all()
+    return [serialize_quiz(quiz, viewer_id=user.id) for quiz in quizzes]
 
 
 @app.post("/api/quizzes", status_code=201)
 def create_quiz(body: QuizIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
     validate_quiz(body)
-    quiz = Quiz(owner_id=user.id, title=body.title.strip(), course_tag=body.course_tag.strip())
+    if body.folder_id is not None:
+        accessible_folder(db, body.folder_id, user.id)
+    quiz = Quiz(owner_id=user.id, folder_id=body.folder_id, title=body.title.strip(), course_tag=body.course_tag.strip())
     quiz.questions = [Question(position=i, **q.model_dump()) for i, q in enumerate(body.questions)]
     db.add(quiz)
     db.commit()
-    return serialize_quiz(owned_quiz(db, quiz.id, user.id))
+    return serialize_quiz(owned_quiz(db, quiz.id, user.id), viewer_id=user.id)
 
 
 @app.get("/api/quizzes/{quiz_id}")
 def get_quiz(quiz_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    return serialize_quiz(owned_quiz(db, quiz_id, user.id))
+    return serialize_quiz(accessible_quiz(db, quiz_id, user.id), viewer_id=user.id)
 
 
 @app.put("/api/quizzes/{quiz_id}")
 def update_quiz(quiz_id: int, body: QuizIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
     validate_quiz(body)
     quiz = owned_quiz(db, quiz_id, user.id)
-    quiz.title, quiz.course_tag = body.title.strip(), body.course_tag.strip()
+    if db.scalar(select(func.count(GameSession.id)).where(GameSession.quiz_id == quiz.id, GameSession.started_at.is_not(None))):
+        raise HTTPException(409, "Played quizzes are locked to preserve result history. Create a new quiz version instead.")
+    if body.folder_id is not None:
+        accessible_folder(db, body.folder_id, user.id)
+    quiz.title, quiz.course_tag, quiz.folder_id = body.title.strip(), body.course_tag.strip(), body.folder_id
     quiz.questions.clear()
     db.flush()
     quiz.questions.extend(Question(position=i, **q.model_dump()) for i, q in enumerate(body.questions))
     db.commit()
-    return serialize_quiz(owned_quiz(db, quiz_id, user.id))
+    return serialize_quiz(owned_quiz(db, quiz_id, user.id), viewer_id=user.id)
 
 
 @app.delete("/api/quizzes/{quiz_id}", status_code=204)
 def delete_quiz(quiz_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     quiz = owned_quiz(db, quiz_id, user.id)
-    if db.scalar(select(func.count(GameSession.id)).where(GameSession.quiz_id == quiz.id)):
-        raise HTTPException(409, "Quizzes with sessions cannot be deleted")
-    db.delete(quiz)
+    pending_sessions = db.scalars(
+        select(GameSession).where(GameSession.quiz_id == quiz.id, GameSession.started_at.is_(None))
+    ).all()
+    for game in pending_sessions:
+        manager.cancel_session_tasks(game.id)
+        db.delete(game)
+    quiz.deleted_at = utcnow()
     db.commit()
 
 
@@ -145,33 +341,254 @@ def new_pin(db: Session) -> str:
     raise HTTPException(503, "Could not allocate a game PIN")
 
 
-def owned_session(db: Session, session_id: int, user_id: int) -> GameSession:
-    game = db.scalar(select(GameSession).where(GameSession.id == session_id).options(selectinload(GameSession.quiz).selectinload(Quiz.questions), selectinload(GameSession.participants)))
-    if not game or game.quiz.owner_id != user_id:
+def session_query(session_id: int):
+    return (
+        select(GameSession)
+        .where(GameSession.id == session_id)
+        .options(
+            selectinload(GameSession.quiz).selectinload(Quiz.questions),
+            selectinload(GameSession.quiz).selectinload(Quiz.owner),
+            selectinload(GameSession.quiz).selectinload(Quiz.folder),
+            selectinload(GameSession.participants),
+            selectinload(GameSession.host),
+        )
+    )
+
+
+def accessible_session(db: Session, session_id: int, user_id: int) -> GameSession:
+    game = db.scalar(session_query(session_id))
+    if not game or user_id not in {game.host_id or game.quiz.owner_id, game.quiz.owner_id}:
+        raise HTTPException(404, "Session not found")
+    return game
+
+
+def hosted_session(db: Session, session_id: int, user_id: int) -> GameSession:
+    game = db.scalar(session_query(session_id))
+    if not game or (game.host_id or game.quiz.owner_id) != user_id:
         raise HTTPException(404, "Session not found")
     return game
 
 
 def session_json(game: GameSession) -> dict:
-    return {"id": game.id, "quiz_id": game.quiz_id, "pin": game.pin, "status": game.status, "current_question_index": game.current_question_index, "is_revealed": game.is_revealed, "started_at": game.started_at, "ended_at": game.ended_at}
+    return {"id": game.id, "quiz_id": game.quiz_id, "host_id": game.host_id, "pin": game.pin, "status": game.status, "current_question_index": game.current_question_index, "is_revealed": game.is_revealed, "started_at": game.started_at, "ended_at": game.ended_at}
+
+
+def load_session(db: Session, session_id: int) -> GameSession | None:
+    return db.scalar(
+        select(GameSession)
+        .where(GameSession.id == session_id)
+        .options(selectinload(GameSession.quiz).selectinload(Quiz.questions), selectinload(GameSession.participants))
+    )
+
+
+def schedule_reveal(session_id: int, question_id: int, delay: float):
+    manager.set_task(session_id, "reveal", auto_reveal(session_id, question_id, delay))
+
+
+def schedule_advance(session_id: int, question_id: int):
+    manager.set_task(session_id, "advance", auto_advance(session_id, question_id, RESULT_DISPLAY_SECONDS))
+
+
+async def auto_reveal(session_id: int, question_id: int, delay: float):
+    await asyncio.sleep(max(0, delay))
+    async with manager.lock(session_id):
+        with SessionLocal() as db:
+            game = load_session(db, session_id)
+            if not game or game.status != "live" or game.is_revealed or game.current_question_index is None:
+                return
+            question = game.quiz.questions[game.current_question_index]
+            if question.id != question_id:
+                return
+            await reveal_game(db, game)
+
+
+async def auto_advance(session_id: int, question_id: int, delay: float):
+    await asyncio.sleep(max(0, delay))
+    async with manager.lock(session_id):
+        with SessionLocal() as db:
+            game = load_session(db, session_id)
+            if not game or game.status != "live" or not game.is_revealed or game.current_question_index is None:
+                return
+            if game.quiz.questions[game.current_question_index].id != question_id:
+                return
+            await advance_game(db, game)
+
+
+async def begin_question(db: Session, game: GameSession, index: int):
+    manager.cancel_task(game.id, "advance")
+    now = utcnow()
+    question = game.quiz.questions[index]
+    game.status = "live"
+    game.current_question_index = index
+    game.question_started_at = now
+    game.question_deadline_at = now + timedelta(seconds=question.time_limit_sec)
+    game.is_revealed = False
+    db.commit()
+    await manager.broadcast(game.id, {"type": "question_start", "question": question_payload(game, question), "question_count": len(game.quiz.questions)})
+    schedule_reveal(game.id, question.id, question.time_limit_sec)
+
+
+async def reveal_game(db: Session, game: GameSession) -> dict:
+    if game.is_revealed or game.current_question_index is None:
+        question = game.quiz.questions[game.current_question_index or 0]
+        return {"reveal": reveal_payload(db, game, question), "leaderboard": leaderboard(db, game.id, update_ranks=False)}
+    manager.cancel_task(game.id, "reveal")
+    game.is_revealed = True
+    db.commit()
+    question = game.quiz.questions[game.current_question_index]
+    reveal_data = {
+        **reveal_payload(db, game, question),
+        "next_in_sec": RESULT_DISPLAY_SECONDS,
+        "next_at": iso(utcnow() + timedelta(seconds=RESULT_DISPLAY_SECONDS)),
+    }
+    board = leaderboard(db, game.id)
+    score_by_participant = {row["participant_id"]: row["score"] for row in board}
+    answers = db.scalars(select(Answer).where(Answer.session_id == game.id, Answer.question_id == question.id)).all()
+    answer_by_participant = {answer.participant_id: answer for answer in answers}
+    personal_results = {}
+    for participant in game.participants:
+        answer = answer_by_participant.get(participant.id)
+        personal_results[participant.id] = {
+            "type": "player_result",
+            "question_id": question.id,
+            "is_correct": bool(answer and answer.is_correct),
+            "points_awarded": answer.points_awarded if answer else 0,
+            "selected_options": answer.selected_options if answer else [],
+            "score": score_by_participant.get(participant.id, 0),
+        }
+    await manager.send_participant_payloads(game.id, personal_results)
+    await manager.broadcast(game.id, {"type": "question_reveal", **reveal_data})
+    await manager.broadcast(game.id, {"type": "leaderboard_update", "leaderboard": board})
+    schedule_advance(game.id, question.id)
+    return {"reveal": reveal_data, "leaderboard": board}
+
+
+async def finish_game(db: Session, game: GameSession):
+    manager.cancel_session_tasks(game.id)
+    game.status, game.ended_at = "ended", utcnow()
+    db.commit()
+    board = leaderboard(db, game.id)
+    await manager.broadcast(game.id, {"type": "session_end", "leaderboard": board})
+    return session_json(game)
+
+
+async def advance_game(db: Session, game: GameSession):
+    next_index = (game.current_question_index or 0) + 1
+    if next_index >= len(game.quiz.questions):
+        return await finish_game(db, game)
+    await begin_question(db, game, next_index)
+    return session_json(game)
 
 
 @app.post("/api/quizzes/{quiz_id}/sessions", status_code=201)
 def create_session(quiz_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    quiz = owned_quiz(db, quiz_id, user.id)
+    quiz = accessible_quiz(db, quiz_id, user.id)
     if not quiz.questions:
         raise HTTPException(422, "Add at least one question before launching")
-    game = GameSession(quiz_id=quiz.id, pin=new_pin(db))
+    game = GameSession(quiz_id=quiz.id, host_id=user.id, pin=new_pin(db))
     db.add(game)
     db.commit()
     db.refresh(game)
     return session_json(game)
 
 
+@app.get("/api/sessions/history")
+def session_history(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    games = db.scalars(
+        select(GameSession)
+        .join(Quiz)
+        .where(or_(GameSession.host_id == user.id, Quiz.owner_id == user.id), GameSession.started_at.is_not(None))
+        .options(
+            selectinload(GameSession.quiz).selectinload(Quiz.questions),
+            selectinload(GameSession.quiz).selectinload(Quiz.owner),
+            selectinload(GameSession.participants),
+            selectinload(GameSession.host),
+        )
+        .order_by(GameSession.started_at.desc())
+    ).unique().all()
+    return [
+        {
+            "id": game.id,
+            "quiz_id": game.quiz_id,
+            "quiz_title": game.quiz.title,
+            "course_tag": game.quiz.course_tag,
+            "pin": game.pin,
+            "status": game.status,
+            "started_at": game.started_at,
+            "ended_at": game.ended_at,
+            "participant_count": len(game.participants),
+            "question_count": len(game.quiz.questions),
+            "host": {"id": (game.host or game.quiz.owner).id, "name": (game.host or game.quiz.owner).name, "email": (game.host or game.quiz.owner).email},
+            "quiz_owner": {"id": game.quiz.owner.id, "name": game.quiz.owner.name},
+            "hosted_by_me": (game.host_id or game.quiz.owner_id) == user.id,
+            "used_my_quiz": game.quiz.owner_id == user.id and (game.host_id or game.quiz.owner_id) != user.id,
+            "can_delete": (game.host_id or game.quiz.owner_id) == user.id,
+        }
+        for game in games
+    ]
+
+
 @app.get("/api/sessions/{session_id}")
 def get_session(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    game = owned_session(db, session_id, user.id)
+    game = accessible_session(db, session_id, user.id)
     return session_snapshot(db, game)
+
+
+@app.get("/api/sessions/{session_id}/statistics")
+def session_statistics(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    game = accessible_session(db, session_id, user.id)
+    board = leaderboard(db, game.id, update_ranks=False)
+    answers = db.scalars(select(Answer).where(Answer.session_id == game.id)).all()
+    by_question: dict[int, list[Answer]] = {}
+    for answer in answers:
+        by_question.setdefault(answer.question_id, []).append(answer)
+    question_stats = []
+    for question in game.quiz.questions:
+        question_answers = by_question.get(question.id, [])
+        correct_count = sum(1 for answer in question_answers if answer.is_correct)
+        question_stats.append(
+            {
+                "id": question.id,
+                "position": question.position,
+                "text": question.text,
+                "options": question.options,
+                "correct_options": question.correct_options,
+                "distribution": answer_distribution(db, game, question),
+                "response_count": len(question_answers),
+                "correct_count": correct_count,
+                "correct_rate": round(correct_count / len(game.participants) * 100, 1) if game.participants else 0,
+            }
+        )
+    total_possible = len(game.participants) * len(game.quiz.questions)
+    total_correct = sum(1 for answer in answers if answer.is_correct)
+    return {
+        "session": {
+            "id": game.id,
+            "quiz_title": game.quiz.title,
+            "course_tag": game.quiz.course_tag,
+            "pin": game.pin,
+            "status": game.status,
+            "started_at": game.started_at,
+            "ended_at": game.ended_at,
+            "host": {"id": (game.host or game.quiz.owner).id, "name": (game.host or game.quiz.owner).name},
+        },
+        "summary": {
+            "participants": len(game.participants),
+            "questions": len(game.quiz.questions),
+            "average_accuracy": round(total_correct / total_possible * 100, 1) if total_possible else 0,
+            "average_score": round(sum(row["score"] for row in board) / len(board)) if board else 0,
+        },
+        "leaderboard": board,
+        "questions": question_stats,
+    }
+
+
+@app.delete("/api/sessions/{session_id}", status_code=204)
+def delete_session(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    game = hosted_session(db, session_id, user.id)
+    manager.cancel_session_tasks(game.id)
+    db.delete(game)
+    db.commit()
 
 
 @app.post("/api/sessions/join")
@@ -189,67 +606,54 @@ async def join(body: JoinIn, db: Session = Depends(get_db)):
     db.add(participant)
     db.commit()
     db.refresh(participant)
-    await manager.broadcast(game.id, {"type": "player_joined", "participants": [{"id": p.id, "display_name": p.display_name} for p in [*game.participants, participant]]})
+    participants = db.scalars(select(Participant).where(Participant.session_id == game.id).order_by(Participant.joined_at)).all()
+    await manager.broadcast(game.id, {"type": "player_joined", "participants": [{"id": p.id, "display_name": p.display_name} for p in participants]})
     return {"session_id": game.id, "participant_id": participant.id, "resume_token": participant.resume_token, "display_name": participant.display_name}
 
 
 @app.post("/api/sessions/{session_id}/start")
 async def start_session(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    game = owned_session(db, session_id, user.id)
+    game = hosted_session(db, session_id, user.id)
     if game.status != "pending":
         raise HTTPException(409, "Session is not in the lobby")
-    now = utcnow()
-    question = game.quiz.questions[0]
-    game.status, game.current_question_index, game.started_at = "live", 0, now
-    game.question_started_at, game.question_deadline_at = now, now + timedelta(seconds=question.time_limit_sec)
-    game.is_revealed = False
-    db.commit()
-    await manager.broadcast(game.id, {"type": "question_start", "question": question_payload(game, question), "question_count": len(game.quiz.questions)})
+    game.started_at = utcnow()
+    await begin_question(db, game, 0)
     return session_json(game)
 
 
 @app.post("/api/sessions/{session_id}/reveal")
 async def reveal(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    game = owned_session(db, session_id, user.id)
+    game = hosted_session(db, session_id, user.id)
     if game.status != "live" or game.current_question_index is None:
         raise HTTPException(409, "No live question")
-    game.is_revealed = True
-    db.commit()
-    question = game.quiz.questions[game.current_question_index]
-    reveal_data = reveal_payload(db, game, question)
-    board = leaderboard(db, game.id)
-    await manager.broadcast(game.id, {"type": "question_reveal", **reveal_data})
-    await manager.broadcast(game.id, {"type": "leaderboard_update", "leaderboard": board})
-    return {"reveal": reveal_data, "leaderboard": board}
+    async with manager.lock(game.id):
+        db.expire_all()
+        game = hosted_session(db, session_id, user.id)
+        return await reveal_game(db, game)
 
 
 @app.post("/api/sessions/{session_id}/next")
 async def next_question(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    game = owned_session(db, session_id, user.id)
+    game = hosted_session(db, session_id, user.id)
     if game.status != "live" or not game.is_revealed:
         raise HTTPException(409, "Reveal the current answer first")
-    next_index = (game.current_question_index or 0) + 1
-    if next_index >= len(game.quiz.questions):
-        return await finish_session(session_id, user, db)
-    now = utcnow()
-    question = game.quiz.questions[next_index]
-    game.current_question_index, game.question_started_at = next_index, now
-    game.question_deadline_at, game.is_revealed = now + timedelta(seconds=question.time_limit_sec), False
-    db.commit()
-    await manager.broadcast(game.id, {"type": "question_start", "question": question_payload(game, question), "question_count": len(game.quiz.questions)})
-    return session_json(game)
+    async with manager.lock(game.id):
+        db.expire_all()
+        game = hosted_session(db, session_id, user.id)
+        if game.status != "live" or not game.is_revealed:
+            raise HTTPException(409, "The session has already advanced")
+        return await advance_game(db, game)
 
 
 @app.post("/api/sessions/{session_id}/end")
 async def finish_session(session_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
-    game = owned_session(db, session_id, user.id)
+    game = hosted_session(db, session_id, user.id)
     if game.status == "ended":
         return session_json(game)
-    game.status, game.ended_at = "ended", utcnow()
-    db.commit()
-    board = leaderboard(db, game.id)
-    await manager.broadcast(game.id, {"type": "session_end", "leaderboard": board})
-    return session_json(game)
+    async with manager.lock(game.id):
+        db.expire_all()
+        game = hosted_session(db, session_id, user.id)
+        return await finish_game(db, game)
 
 
 def export_rows(db: Session, game: GameSession):
@@ -275,7 +679,7 @@ def export_rows(db: Session, game: GameSession):
 
 @app.get("/api/sessions/{session_id}/export")
 def export(session_id: int, format: str = Query("xlsx", pattern="^(xlsx|csv)$"), user: User = Depends(current_user), db: Session = Depends(get_db)):
-    game = owned_session(db, session_id, user.id)
+    game = accessible_session(db, session_id, user.id)
     headers = ["Student Name", "Student ID", *[f"Q{i + 1}" for i in range(len(game.quiz.questions))], "Total Correct", "Accuracy %", "Total Score", "Rank"]
     rows = export_rows(db, game)
     stem = f"{game.quiz.course_tag or 'quiz'}-{game.pin}-results"
@@ -326,7 +730,7 @@ async def websocket_session(websocket: WebSocket, session_id: int, participant_t
             except HTTPException:
                 await websocket.close(code=4401)
                 return
-            if game.quiz.owner_id != user_id:
+            if (game.host_id or game.quiz.owner_id) != user_id:
                 await websocket.close(code=4403)
                 return
             role = "host"
@@ -373,7 +777,10 @@ async def websocket_session(websocket: WebSocket, session_id: int, participant_t
             score = db.scalar(select(func.coalesce(func.sum(Answer.points_awarded), 0)).where(Answer.participant_id == participant.id)) or 0
             await manager.send(websocket, {"type": "answer_accepted", "question_id": question.id, "score": int(score)})
             count = db.scalar(select(func.count(Answer.id)).where(Answer.session_id == session_id, Answer.question_id == question.id)) or 0
-            await manager.broadcast(session_id, {"type": "question_progress", "question_id": question.id, "response_count": count, "distribution": answer_distribution(db, game, question)}, role="host")
+            await manager.broadcast(session_id, {"type": "question_progress", "question_id": question.id, "response_count": count}, role="host")
+            participant_count = db.scalar(select(func.count(Participant.id)).where(Participant.session_id == session_id)) or 0
+            if participant_count and count >= participant_count:
+                schedule_reveal(session_id, question.id, 0)
     except WebSocketDisconnect:
         pass
     finally:

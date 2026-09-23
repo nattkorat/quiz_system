@@ -2,13 +2,13 @@ services:
   db:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: quizforge
-      POSTGRES_USER: quizforge
-      POSTGRES_PASSWORD: quizforge
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
     volumes:
       - quizforge_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U quizforge"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -16,11 +16,13 @@ services:
   backend:
     build: ./backend
     environment:
-      DATABASE_URL: postgresql+psycopg://quizforge:quizforge@db:5432/quizforge
-      JWT_SECRET: ${JWT_SECRET:-replace-this-before-production}
-      DEFAULT_INSTRUCTOR_EMAIL: ${DEFAULT_INSTRUCTOR_EMAIL:-instructor@example.com}
-      DEFAULT_INSTRUCTOR_PASSWORD: ${DEFAULT_INSTRUCTOR_PASSWORD:-change-me-123}
-      CORS_ORIGINS: http://localhost:8080
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in .env}
+      DEFAULT_INSTRUCTOR_NAME: ${DEFAULT_INSTRUCTOR_NAME:?Set DEFAULT_INSTRUCTOR_NAME in .env}
+      DEFAULT_INSTRUCTOR_EMAIL: ${DEFAULT_INSTRUCTOR_EMAIL:?Set DEFAULT_INSTRUCTOR_EMAIL in .env}
+      DEFAULT_INSTRUCTOR_PASSWORD: ${DEFAULT_INSTRUCTOR_PASSWORD:?Set DEFAULT_INSTRUCTOR_PASSWORD in .env}
+      RESULT_DISPLAY_SECONDS: ${RESULT_DISPLAY_SECONDS:?Set RESULT_DISPLAY_SECONDS in .env}
+      CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS in .env}
     depends_on:
       db:
         condition: service_healthy
@@ -36,4 +38,3 @@ services:
 
 volumes:
   quizforge_data:
-

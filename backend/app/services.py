@@ -37,6 +37,10 @@ def session_snapshot(db: Session, game: GameSession, participant_id: int | None 
     if game.status == "live" and game.current_question_index is not None:
         question = game.quiz.questions[game.current_question_index]
         payload["question"] = question_payload(game, question)
+        if participant_id is None:
+            payload["response_count"] = db.scalar(
+                select(func.count(Answer.id)).where(Answer.session_id == game.id, Answer.question_id == question.id)
+            ) or 0
         if game.is_revealed:
             payload["reveal"] = reveal_payload(db, game, question)
     if participant_id:
@@ -45,7 +49,17 @@ def session_snapshot(db: Session, game: GameSession, participant_id: int | None 
         if game.current_question_index is not None:
             current = game.quiz.questions[game.current_question_index]
             answered = db.scalar(select(Answer).where(Answer.participant_id == participant_id, Answer.question_id == current.id))
-        payload["me"] = {"participant_id": participant_id, "score": score or 0, "answered": bool(answered)}
+        payload["me"] = {
+            "participant_id": participant_id,
+            "score": score or 0,
+            "answered": bool(answered),
+            "selected_options": answer.selected_options if (answer := answered) else [],
+        }
+        if answered and game.is_revealed:
+            payload["me"]["current_result"] = {
+                "is_correct": answered.is_correct,
+                "points_awarded": answered.points_awarded,
+            }
     if game.status == "ended" or game.is_revealed:
         payload["leaderboard"] = leaderboard(db, game.id, update_ranks=False)
     return payload

@@ -11,29 +11,38 @@ docker compose up --build
 
 Open [http://localhost:8080](http://localhost:8080).
 
-Default instructor login:
-
-- Email: `instructor@example.com`
-- Password: `change-me-123`
-
-Change both credentials and `JWT_SECRET` in `.env` before a real deployment.
+The initial instructor name, email, and password come from `.env`. Set strong deployment values for the instructor password, database password, and `JWT_SECRET` before starting the app.
 
 ## Classroom workflow
 
-1. Sign in and select **New quiz**.
-2. Add a title, course tag, questions, 2–6 options, correct answer(s), time, and points.
-3. From the library, select **Launch**. Share the 6-digit PIN, link, or QR code.
+1. Sign in, create a course folder, and share it with other registered instructors by email when needed.
+2. Select **New quiz**. Choose its folder, then add a title, course tag, questions, 2–6 options, correct answer(s), time, and points.
+3. Find quizzes by folder, title, course tag, or instructor. Any instructor with folder access can select **Review** to inspect all questions and correct answers, then **Play** and share the 6-digit PIN, link, or QR code.
 4. Students open `/join`, enter the PIN, their name, and optional student ID.
-5. Start the quiz. Reveal each answer, show the leaderboard, and advance when ready.
+5. Start the quiz. The server reveals results when everyone answers or time expires, then advances automatically after the result screen.
 6. At the end, export XLSX or CSV. The file includes each question result, total correct, accuracy, score, and rank.
+7. Open **Stats** in session history for question analysis and the leaderboard, or re-export XLSX/CSV later.
+8. Session hosts may remove test runs. Quiz owners can see sessions hosted by collaborators who used their quizzes.
 
 Student reconnect tokens are kept in that device's browser. Refreshing the player page restores the session and score.
+
+Instructor sound effects and original background quiz music are controlled separately from the presenter bar. Music starts only after the instructor clicks its control because browsers block automatic audio.
+
+While answers are open, the presenter sees only the total response count; per-option counts stay hidden until reveal. A short sound plays for every accepted answer when instructor SFX is enabled.
+
+Played quiz definitions are locked so later editing cannot change historical results. Create a new quiz version when you need different questions.
+
+Deleting a quiz removes it from the library without touching played sessions. Its statistics and exports remain in session history until the session host deletes those sessions.
+
+Folder sharing grants access to view and play every quiz in that folder and to add new quizzes. Each quiz remains editable and deletable only by its creator. A session can be removed only by the instructor who hosted it; the quiz owner can still view its statistics and export the result.
 
 ## Local development
 
 Backend:
 
 ```bash
+cp .env.example .env
+# Edit every required value in .env
 cd backend
 python3 -m venv .venv
 source .venv/bin/activate
@@ -50,6 +59,7 @@ npm run dev
 ```
 
 The backend uses SQLite by default for local development. Docker Compose uses PostgreSQL.
+The frontend reads its API, WebSocket, and local proxy addresses from the root `.env`. For a separately hosted frontend, set `VITE_API_URL` and `VITE_WS_URL` to the public HTTPS and WSS backend addresses during the frontend build.
 
 ## API and real-time behavior
 
@@ -59,6 +69,8 @@ The backend uses SQLite by default for local development. Docker Compose uses Po
 - Health check: `/api/health`
 
 Correctness and response time are computed on the server. Correct responses receive the question's base points multiplied by a linear speed factor from `1.0` down to `0.5`. Duplicate and late answers are rejected.
+
+`RESULT_DISPLAY_SECONDS` controls how long the per-question result remains visible before the server advances. The default is six seconds.
 
 ## Tests
 
