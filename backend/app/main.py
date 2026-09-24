@@ -5,6 +5,7 @@ import csv
 import io
 import random
 import secrets
+import time
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
@@ -24,6 +25,10 @@ from .models import Answer, CourseFolder, FolderMember, GameSession, Participant
 from .realtime import Client, manager
 from .schemas import FolderIn, FolderMemberIn, ForgotPasswordIn, JoinIn, LoginIn, QuizIn, RegisterIn, ResetPasswordIn
 from .services import answer_distribution, expected_submission, iso, leaderboard, question_payload, reveal_payload, session_snapshot
+
+
+REACTION_EMOJIS = {"👏", "🔥", "😂", "🤯", "❤️", "👍"}
+REACTION_MIN_INTERVAL_SECONDS = 0.75
 
 
 def initialize_database():
@@ -629,8 +634,6 @@ async def join(body: JoinIn, db: Session = Depends(get_db)):
         participant = db.scalar(select(Participant).where(Participant.session_id == game.id, Participant.resume_token == body.resume_token))
         if participant:
             return {"session_id": game.id, "participant_id": participant.id, "resume_token": participant.resume_token, "display_name": participant.display_name}
-    if game.status != "pending":
-        raise HTTPException(409, "This quiz has already started")
     participant = Participant(session_id=game.id, display_name=body.display_name.strip(), student_id=(body.student_id or "").strip() or None, resume_token=secrets.token_urlsafe(32))
     db.add(participant)
     db.commit()
@@ -769,9 +772,30 @@ async def websocket_session(websocket: WebSocket, session_id: int, participant_t
         client = Client(websocket, role, participant.id if participant else None)
         await manager.connect(session_id, client)
         await manager.send(websocket, session_snapshot(db, game, participant.id if participant else None))
+        last_reaction_at = 0.0
         while True:
             data = await websocket.receive_json()
-            if role != "player" or data.get("type") != "answer_submitted":
+            if role != "player":
+                continue
+            if data.get("type") == "reaction_send":
+                now_monotonic = time.monotonic()
+                if now_monotonic - last_reaction_at < REACTION_MIN_INTERVAL_SECONDS:
+                    await manager.send(websocket, {"type": "reaction_rejected", "message": "Slow down a little"})
+                    continue
+                db.expire_all()
+                current_status = db.scalar(select(GameSession.status).where(GameSession.id == session_id))
+                kind = data.get("kind")
+                content = str(data.get("content", "")).strip()
+                if kind == "chat":
+                    content = " ".join(content.split())[:80]
+                valid_reaction = current_status in {"pending", "live"} and ((kind == "emoji" and content in REACTION_EMOJIS) or (kind == "chat" and bool(content)))
+                if not valid_reaction:
+                    await manager.send(websocket, {"type": "reaction_rejected", "message": "That reaction could not be sent"})
+                    continue
+                last_reaction_at = now_monotonic
+                await manager.broadcast(session_id, {"type": "reaction", "event_id": secrets.token_hex(6), "participant_id": participant.id, "display_name": participant.display_name, "kind": kind, "content": content, "x": secrets.randbelow(70) + 15})
+                continue
+            if data.get("type") != "answer_submitted":
                 continue
             db.expire_all()
             game = db.scalar(select(GameSession).where(GameSession.id == session_id).options(selectinload(GameSession.quiz).selectinload(Quiz.questions)))

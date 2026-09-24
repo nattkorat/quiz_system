@@ -167,6 +167,35 @@ def test_websocket_answer_is_scored_and_broadcast():
         assert locked.status_code == 409
 
 
+def test_late_student_can_join_and_send_live_reactions():
+    with TestClient(app) as client:
+        headers = auth(client)
+        quiz_id = client.post("/api/quizzes", json=sample_quiz(), headers=headers).json()["id"]
+        game = client.post(f"/api/quizzes/{quiz_id}/sessions", headers=headers).json()
+        first = client.post("/api/sessions/join", json={"pin": game["pin"], "display_name": "First"})
+        assert first.status_code == 200
+        assert client.post(f"/api/sessions/{game['id']}/start", headers=headers).status_code == 200
+
+        late = client.post("/api/sessions/join", json={"pin": game["pin"], "display_name": "Late Student"})
+        assert late.status_code == 200
+        access_token = headers["Authorization"].split(" ", 1)[1]
+        with client.websocket_connect(f"/ws/sessions/{game['id']}?access_token={access_token}") as host_socket:
+            assert host_socket.receive_json()["type"] == "snapshot"
+            with client.websocket_connect(f"/ws/sessions/{game['id']}?participant_token={late.json()['resume_token']}") as player_socket:
+                snapshot = player_socket.receive_json()
+                assert snapshot["type"] == "snapshot"
+                assert snapshot["session"]["status"] == "live"
+                player_socket.send_json({"type": "reaction_send", "kind": "emoji", "content": "🔥"})
+                player_reaction = player_socket.receive_json()
+                host_reaction = host_socket.receive_json()
+                assert player_reaction["type"] == "reaction"
+                assert host_reaction["type"] == "reaction"
+                assert host_reaction["display_name"] == "Late Student"
+                assert host_reaction["content"] == "🔥"
+                player_socket.send_json({"type": "reaction_send", "kind": "chat", "content": "hello"})
+                assert player_socket.receive_json() == {"type": "reaction_rejected", "message": "Slow down a little"}
+
+
 def test_shared_folder_quiz_usage_statistics_and_session_removal():
     with TestClient(app) as client:
         owner = register(client, "Quiz Owner", "owner@example.com")

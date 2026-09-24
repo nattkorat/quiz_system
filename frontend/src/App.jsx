@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, BarChart3, Check, ChevronDown, ChevronUp, CirclePlay, Clock3, Copy, Download, Eye, EyeOff, FilePlus2, Folder, FolderOpen, GraduationCap, GripVertical, History, KeyRound, ListOrdered, LogOut, Music2, Pause, Play, Plus, Radio, Save, Search, Share2, ShieldCheck, Shuffle, Trash2, UserPlus, Users, Volume2, VolumeX, X, Zap } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, BarChart3, Check, ChevronDown, ChevronUp, CirclePlay, Clock3, Copy, Download, Eye, EyeOff, FilePlus2, Folder, FolderOpen, GraduationCap, GripVertical, History, KeyRound, ListOrdered, LogOut, Maximize2, MessageCircle, Music2, Pause, Play, Plus, QrCode, Radio, Save, Search, Send, Share2, ShieldCheck, Shuffle, Trash2, UserPlus, Users, Volume2, VolumeX, X, Zap } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { api, clearAuth, downloadExport, getToken, setAuth, socketUrl } from "./api";
 
 const palette = ["coral", "blue", "gold", "violet", "green", "pink"];
+const reactionEmojis = ["👏", "🔥", "😂", "🤯", "❤️", "👍"];
 const questionTypeLabels = { single: "Single choice", multi: "Multiple choice", order: "Drag to order", matching: "Matching pairs" };
 const blankQuestion = () => ({ text: "", type: "single", options: ["", ""], match_options: [], correct_options: [0], time_limit_sec: 20, points: 1000 });
 
@@ -314,6 +315,32 @@ function useLiveSocket(sessionId, params, onMessage) {
   return connected;
 }
 
+function useFloatingReactions() {
+  const [reactions, setReactions] = useState([]); const timers = useRef(new Map());
+  const addReaction = useCallback(message => {
+    const id = message.event_id || `${Date.now()}-${Math.random()}`;
+    setReactions(current => [...current.slice(-11), { ...message, event_id: id }]);
+    const timer = setTimeout(() => { setReactions(current => current.filter(item => item.event_id !== id)); timers.current.delete(id); }, 4200);
+    timers.current.set(id, timer);
+  }, []);
+  useEffect(() => () => { timers.current.forEach(clearTimeout); timers.current.clear(); }, []);
+  return { reactions, addReaction };
+}
+
+function ReactionLayer({ reactions }) {
+  return <div className="reaction-layer" aria-live="polite" aria-label="Live class reactions">{reactions.map((reaction, index) => <div className={`floating-reaction ${reaction.kind}`} style={{ left: `${reaction.x || 50}%`, "--reaction-drift": `${(index % 3 - 1) * 28}px` }} key={reaction.event_id}>{reaction.kind === "emoji" ? <span>{reaction.content}</span> : <><MessageCircle /><strong>{reaction.content}</strong></>}<small>{reaction.display_name}</small></div>)}</div>;
+}
+
+function ReactionComposer({ socket, connected, notice }) {
+  const [open, setOpen] = useState(false); const [chat, setChat] = useState("");
+  function send(kind, content) {
+    if (!content.trim() || !socket.current || socket.current.readyState !== WebSocket.OPEN) return;
+    socket.current.send(JSON.stringify({ type: "reaction_send", kind, content: content.trim() }));
+    if (kind === "chat") { setChat(""); setOpen(false); }
+  }
+  return <div className={`reaction-composer ${open ? "open" : ""}`}><button className="reaction-toggle" onClick={() => setOpen(value => !value)} aria-expanded={open} aria-label={open ? "Close reactions" : "Send a reaction"}><MessageCircle />React</button>{open && <div className="reaction-popover"><div className="emoji-row">{reactionEmojis.map(emoji => <button disabled={!connected} onClick={() => send("emoji", emoji)} aria-label={`Send ${emoji}`} key={emoji}>{emoji}</button>)}</div><form onSubmit={event => { event.preventDefault(); send("chat", chat); }}><input maxLength={80} value={chat} onChange={event => setChat(event.target.value)} placeholder="Say something…" aria-label="Short class message" /><button disabled={!connected || !chat.trim()} aria-label="Send message"><Send /></button></form>{notice && <small>{notice}</small>}</div>}</div>;
+}
+
 function Leaderboard({ rows = [], me }) {
   const safeRows = Array.isArray(rows) ? rows : [];
   if (!safeRows.length) return <div className="no-data">No scores yet</div>;
@@ -417,9 +444,10 @@ function AutoAdvance({ nextAt, fallback = 6, final = false }) {
 
 function Host() {
   const { sessionId } = useParams(); const navigate = useNavigate();
-  const [state, setState] = useState(null); const [error, setError] = useState(""); const [busy, setBusy] = useState(false); const [copied, setCopied] = useState(false);
+  const [state, setState] = useState(null); const [error, setError] = useState(""); const [busy, setBusy] = useState(false); const [copied, setCopied] = useState(false); const [qrLarge, setQrLarge] = useState(false);
+  const { reactions, addReaction } = useFloatingReactions();
   const sounds = useHostSounds();
-  const handleMessage = useCallback(message => { sounds.play(message.type, message); sounds.handleSessionEvent(message); setState(prev => {
+  const handleMessage = useCallback(message => { sounds.play(message.type, message); sounds.handleSessionEvent(message); if (message.type === "reaction") addReaction(message); setState(prev => {
     if (message.type === "snapshot") return { ...message, response_count: message.reveal?.response_count || 0, distribution: message.reveal?.distribution || [] };
     if (!prev) return prev;
     if (message.type === "player_joined") return { ...prev, participants: message.participants };
@@ -429,7 +457,7 @@ function Host() {
     if (message.type === "leaderboard_update") return { ...prev, leaderboard: message.leaderboard };
     if (message.type === "session_end") return { ...prev, session: { ...prev.session, status: "ended" }, leaderboard: message.leaderboard };
     return prev;
-  }); }, [sounds.play, sounds.handleSessionEvent]);
+  }); }, [sounds.play, sounds.handleSessionEvent, addReaction]);
   const connected = useLiveSocket(sessionId, { access_token: getToken() }, handleMessage);
   useEffect(() => { api(`/sessions/${sessionId}`).then(setState).catch(e => setError(e.message)); }, [sessionId]);
   async function action(name) { sounds.unlock(); setBusy(true); setError(""); try { await api(`/sessions/${sessionId}/${name}`, { method: "POST" }); } catch (e) { setError(e.message); } finally { setBusy(false); } }
@@ -445,13 +473,15 @@ function Host() {
     } catch { setError("Could not copy the link. Share the game PIN instead."); }
   };
   return <div className="host-page">
-    <header className="presenter-bar"><Brand /><div className="presenter-status"><div className={`connection ${connected ? "online" : ""}`}><span />{connected ? "Live" : "Reconnecting"}</div><button className={`sound-toggle ${sounds.enabled ? "enabled" : ""}`} onClick={sounds.toggle} aria-pressed={sounds.enabled}>{sounds.enabled ? <Volume2 /> : <VolumeX />}{sounds.enabled ? "SFX on" : "SFX off"}</button><div className={`music-controls ${sounds.musicEnabled ? "enabled" : ""}`}><button className="music-play" onClick={sounds.toggleMusic} aria-label={sounds.musicPlaying ? "Pause background music" : "Play background music"}>{sounds.musicPlaying ? <Pause /> : <Play />}</button><Music2 /><input aria-label="Background music volume" type="range" min="0" max="100" step="5" value={sounds.musicVolume} onChange={event => sounds.changeMusicVolume(event.target.value)} /><span>{sounds.musicPlaying ? "Music" : sounds.musicEnabled ? "Paused" : "Off"}</span></div></div><button className="text-button" onClick={() => navigate("/dashboard")}>Exit presenter</button></header>
+    <ReactionLayer reactions={reactions} />
+    <header className="presenter-bar"><Brand /><div className="presenter-status">{session.status !== "ended" && <button className="join-info-button" onClick={() => setQrLarge(true)} aria-label={`Show join QR code and link for PIN ${session.pin}`}><QrCode /><span>Join</span><b>{session.pin}</b></button>}<div className={`connection ${connected ? "online" : ""}`}><span />{connected ? "Live" : "Reconnecting"}</div><button className={`sound-toggle ${sounds.enabled ? "enabled" : ""}`} onClick={sounds.toggle} aria-pressed={sounds.enabled}>{sounds.enabled ? <Volume2 /> : <VolumeX />}{sounds.enabled ? "SFX on" : "SFX off"}</button><div className={`music-controls ${sounds.musicEnabled ? "enabled" : ""}`}><button className="music-play" onClick={sounds.toggleMusic} aria-label={sounds.musicPlaying ? "Pause background music" : "Play background music"}>{sounds.musicPlaying ? <Pause /> : <Play />}</button><Music2 /><input aria-label="Background music volume" type="range" min="0" max="100" step="5" value={sounds.musicVolume} onChange={event => sounds.changeMusicVolume(event.target.value)} /><span>{sounds.musicPlaying ? "Music" : sounds.musicEnabled ? "Paused" : "Off"}</span></div></div><button className="text-button" onClick={() => navigate("/dashboard")}>Exit presenter</button></header>
     <ErrorBox error={error} />
-    {session.status === "pending" && <main className="lobby-layout"><section className="join-panel"><p className="eyebrow">JOIN AT {location.host}/join</p><h1>Game PIN</h1><div className="pin-display">{session.pin}</div><button className="copy-link" onClick={copyJoinLink}>{copied ? <Check /> : <Copy />}{copied ? "Copied" : "Copy join link"}</button><div className="qr-wrap"><QRCodeSVG value={joinUrl} size={154} bgColor="transparent" fgColor="#071621" /></div></section>
+    {session.status === "pending" && <main className="lobby-layout"><section className="join-panel"><p className="eyebrow">JOIN AT {location.host}/join</p><h1>Game PIN</h1><div className="pin-display">{session.pin}</div><button className="copy-link" onClick={copyJoinLink}>{copied ? <Check /> : <Copy />}{copied ? "Copied" : "Copy join link"}</button><button className="qr-wrap" onClick={() => setQrLarge(true)} aria-label="Enlarge join QR code"><QRCodeSVG value={joinUrl} size={154} bgColor="transparent" fgColor="#071621" /><span><Maximize2 />Tap to enlarge</span></button></section>
       <section className="lobby-players"><div className="section-title"><div><p className="eyebrow">LOBBY</p><h2>{participants.length} {participants.length === 1 ? "player" : "players"} ready</h2></div><Users size={30} /></div><div className="player-cloud">{participants.map((p, i) => <span key={p.id} style={{ animationDelay: `${i * 35}ms` }}>{p.display_name}</span>)}</div>{!participants.length && <div className="waiting"><span className="dots"><i /><i /><i /></span>Waiting for students to join</div>}<Button className="start-button" disabled={busy || !participants.length} onClick={() => action("start")}><CirclePlay />Start quiz</Button></section></main>}
     {session.status === "live" && <main className="live-host"><div className="question-stage"><div className="question-topline"><span>Question {(session.current_question_index ?? 0) + 1} / {session.question_count}</span><span><Users />{state.response_count || 0} / {participants.length} answered</span></div><h1>{question?.text}</h1><HostQuestion question={question} reveal={state.reveal} distribution={state.distribution} /></div>
       <aside className="host-sidebar"><div className="host-action panel"><p className="eyebrow">HOST CONTROL</p>{!session.is_revealed ? <><h2>Answers coming in</h2><p>{state.response_count || 0} of {participants.length} responses locked. Results appear when everyone answers or time expires.</p><Button disabled={busy} onClick={() => action("reveal")}><ShieldCheck />Reveal now</Button></> : <><h2>Scores updated</h2><AutoAdvance nextAt={state.reveal?.next_at} fallback={state.reveal?.next_in_sec || 6} final={(session.current_question_index ?? 0) + 1 >= session.question_count} /><Button disabled={busy} onClick={() => action((session.current_question_index ?? 0) + 1 >= session.question_count ? "end" : "next")}>{(session.current_question_index ?? 0) + 1 >= session.question_count ? "Show final results" : "Next now"}<ArrowRight /></Button></>}</div>{session.is_revealed && <div className="panel compact-board"><p className="eyebrow">LEADERBOARD</p><Leaderboard rows={board?.slice(0, 5)} /></div>}</aside></main>}
     {session.status === "ended" && <main className="final-screen"><div className="final-heading"><p className="eyebrow">SESSION COMPLETE</p><h1>That’s a wrap.</h1><p>{participants.length} players • {session.question_count} questions • PIN {session.pin}</p></div><div className="final-grid"><section className="panel"><div className="section-title"><h2>Final leaderboard</h2><GraduationCap /></div><Leaderboard rows={board} /></section><aside className="export-card"><Download size={34} /><h2>Gradebook ready</h2><p>One row per student, with question results, accuracy, score, and rank.</p><Button onClick={() => exportFile("xlsx")}><Download />Export XLSX</Button><Button variant="secondary" onClick={() => exportFile("csv")}>Export CSV</Button><button className="text-button" onClick={() => navigate("/dashboard")}>Back to library</button></aside></div></main>}
+    {qrLarge && <Modal title="Join this live quiz" onClose={() => setQrLarge(false)}><div className="qr-large"><QRCodeSVG value={joinUrl} size={420} bgColor="#ffffff" fgColor="#071621" /><div><b>PIN {session.pin}</b><a href={joinUrl} target="_blank" rel="noreferrer">{joinUrl}</a><span>Students can join even after the quiz starts.</span></div><Button onClick={copyJoinLink}>{copied ? <Check /> : <Copy />}{copied ? "Link copied" : "Copy student join link"}</Button></div></Modal>}
   </div>;
 }
 
@@ -459,7 +489,7 @@ function Join() {
   const navigate = useNavigate(); const [params] = useSearchParams();
   const [form, setForm] = useState({ pin: params.get("pin") || "", display_name: "", student_id: "" }); const [error, setError] = useState(""); const [busy, setBusy] = useState(false);
   async function submit(event) { event.preventDefault(); setBusy(true); setError(""); try { const result = await api("/sessions/join", { method: "POST", body: JSON.stringify(form) }); localStorage.setItem(`quizforge_player_${result.session_id}`, result.resume_token); navigate(`/play/${result.session_id}`); } catch (e) { setError(e.message); } finally { setBusy(false); } }
-  return <div className="join-page"><div className="join-glow" /><div className="join-card"><Brand /><div className="join-icon"><Radio /></div><p className="eyebrow">JOIN LIVE QUIZ</p><h1>Ready to play?</h1><p className="muted">Enter the code on the classroom screen.</p><form onSubmit={submit}><ErrorBox error={error} /><label>Game PIN<input inputMode="numeric" pattern="[0-9]*" maxLength={6} value={form.pin} onChange={e => setForm({ ...form, pin: e.target.value.replace(/\D/g, "") })} placeholder="000000" className="pin-input" required /></label><label>Your name<input value={form.display_name} maxLength={80} onChange={e => setForm({ ...form, display_name: e.target.value })} placeholder="Sokha" required /></label><label>Student ID <span>optional</span><input value={form.student_id} onChange={e => setForm({ ...form, student_id: e.target.value })} placeholder="e.g. 20260042" /></label><Button disabled={busy || form.pin.length < 4}>{busy ? "Joining…" : "Join game"}<ArrowRight /></Button></form></div></div>;
+  return <div className="join-page"><div className="join-glow" /><div className="join-card"><Brand /><div className="join-icon"><Radio /></div><p className="eyebrow">JOIN LIVE QUIZ</p><h1>Ready to play?</h1><p className="muted">Enter the code on the classroom screen. Late? You can still join while the quiz is live.</p><form onSubmit={submit}><ErrorBox error={error} /><label>Game PIN<input inputMode="numeric" pattern="[0-9]*" maxLength={6} value={form.pin} onChange={e => setForm({ ...form, pin: e.target.value.replace(/\D/g, "") })} placeholder="000000" className="pin-input" required /></label><label>Your name<input value={form.display_name} maxLength={80} onChange={e => setForm({ ...form, display_name: e.target.value })} placeholder="Sokha" required /></label><label>Student ID <span>optional</span><input value={form.student_id} onChange={e => setForm({ ...form, student_id: e.target.value })} placeholder="e.g. 20260042" /></label><Button disabled={busy || form.pin.length < 4}>{busy ? "Joining…" : "Join game"}<ArrowRight /></Button></form></div></div>;
 }
 
 function Countdown({ deadline, onExpire }) {
@@ -518,8 +548,12 @@ function QuestionStatistics({ question }) {
 
 function Player() {
   const { sessionId } = useParams(); const navigate = useNavigate(); const token = localStorage.getItem(`quizforge_player_${sessionId}`);
-  const [state, setState] = useState(null); const [selected, setSelected] = useState([]); const [submitted, setSubmitted] = useState(false); const [expired, setExpired] = useState(false); const [notice, setNotice] = useState(""); const [dragIndex, setDragIndex] = useState(null); const socket = useRef(null);
-  const onMessage = useCallback((message, ws) => { socket.current = ws; setState(prev => {
+  const [state, setState] = useState(null); const [selected, setSelected] = useState([]); const [submitted, setSubmitted] = useState(false); const [expired, setExpired] = useState(false); const [notice, setNotice] = useState(""); const [reactionNotice, setReactionNotice] = useState(""); const [dragIndex, setDragIndex] = useState(null); const socket = useRef(null);
+  const { reactions, addReaction } = useFloatingReactions();
+  const onMessage = useCallback((message, ws) => { socket.current = ws;
+    if (message.type === "reaction") { addReaction(message); setReactionNotice(""); return; }
+    if (message.type === "reaction_rejected") { setReactionNotice(message.message); setTimeout(() => setReactionNotice(""), 1800); return; }
+    setState(prev => {
     if (message.type === "snapshot") { const answered = Boolean(message.me?.answered); setSubmitted(answered); setSelected(answered ? message.me?.selected_options || [] : initialSelection(message.question)); setExpired(Boolean(message.session?.is_revealed) || (message.question?.deadline ? Date.now() >= new Date(message.question.deadline).getTime() : false)); return message; }
     if (!prev) return prev;
     if (message.type === "question_start") { setSelected(initialSelection(message.question)); setSubmitted(false); setExpired(false); setNotice(""); setDragIndex(null); return { ...prev, session: { ...prev.session, status: "live", is_revealed: false, current_question_index: message.question.position, question_count: message.question_count }, question: message.question, reveal: null, leaderboard: null, me: { ...prev.me, answered: false, selected_options: [], current_result: null } }; }
@@ -530,7 +564,7 @@ function Player() {
     if (message.type === "leaderboard_update") return { ...prev, leaderboard: message.leaderboard };
     if (message.type === "session_end") return { ...prev, session: { ...prev.session, status: "ended" }, leaderboard: message.leaderboard };
     return prev;
-  }); }, []);
+  }); }, [addReaction]);
   const connected = useLiveSocket(sessionId, { participant_token: token || "" }, onMessage);
   if (!token) return <Navigate to="/join" replace />;
   if (!state) return <div className="player-page"><Loader label="Joining the room…" /></div>;
@@ -540,12 +574,12 @@ function Player() {
   const wasCorrect = Boolean(me.current_result?.is_correct);
   const complete = question?.type === "matching" ? selected.length === (question.left_items?.length || 0) && selected.every(Number.isInteger) && new Set(selected).size === selected.length : question?.type === "order" ? selected.length === (question.items?.length || 0) : selected.length > 0;
   function submit() { if (!complete || expired || !socket.current || socket.current.readyState !== WebSocket.OPEN) return; socket.current.send(JSON.stringify({ type: "answer_submitted", question_id: question.id, selected_options: selected })); }
-  if (session.status === "pending") return <div className="player-page waiting-room"><div className="player-status"><Brand /><div className="ready-check"><Check /></div><p className="eyebrow">YOU’RE IN</p><h1>Eyes up front.</h1><p>Your instructor will start <b>{session.quiz_title}</b> soon.</p><span className={`connection ${connected ? "online" : ""}`}><i />{connected ? "Connected" : "Reconnecting"}</span></div></div>;
+  if (session.status === "pending") return <div className="player-page waiting-room"><ReactionLayer reactions={reactions} /><div className="player-status"><Brand /><div className="ready-check"><Check /></div><p className="eyebrow">YOU’RE IN</p><h1>Eyes up front.</h1><p>Your instructor will start <b>{session.quiz_title}</b> soon.</p><span className={`connection ${connected ? "online" : ""}`}><i />{connected ? "Connected" : "Reconnecting"}</span></div><ReactionComposer socket={socket} connected={connected} notice={reactionNotice} /></div>;
   if (session.status === "ended") return <div className="player-page result-page"><div className="result-card"><p className="eyebrow">FINAL RESULT</p><h1>{myRow ? `#${myRow.rank}` : "Finished"}</h1><h2>{myRow?.display_name || "Quiz complete"}</h2><div className="score-big">{(myRow?.score ?? me.score ?? 0).toLocaleString()}<span>points</span></div><Leaderboard rows={safeLeaderboard.slice(0, 5)} me={myRow?.participant_id} /><Button onClick={() => navigate("/join")}>Join another game</Button></div></div>;
-  return <div className="player-page play-surface"><header className="player-bar"><span>Q{(session.current_question_index ?? 0) + 1}/{session.question_count}</span><strong>{session.quiz_title}</strong><span>{(me.score || 0).toLocaleString()} pts</span></header>
+  return <div className="player-page play-surface"><ReactionLayer reactions={reactions} /><header className="player-bar"><span>Q{(session.current_question_index ?? 0) + 1}/{session.question_count}</span><strong>{session.quiz_title}</strong><span>{(me.score || 0).toLocaleString()} pts</span></header>
     <main className="player-main">{question && <><div className="player-question"><Countdown deadline={question.deadline} onExpire={() => { setExpired(true); setNotice("Time is up — waiting for results"); }} /><h1>{question.text}</h1><p>{question.type === "multi" ? "Select all correct answers" : question.type === "order" ? "Drag the steps into the correct order" : question.type === "matching" ? "Match every item with its partner" : "Choose one answer"}</p></div><PlayerQuestionInput question={question} selected={selected} setSelected={setSelected} locked={submitted || expired || Boolean(reveal)} reveal={reveal} dragIndex={dragIndex} setDragIndex={setDragIndex} />{reveal && !wasCorrect && question.type === "order" && <div className="correct-solution"><b>Correct order</b>{reveal.correct_sequence.map((id, index) => <span key={id}>{index + 1}. {question.items.find(item => item.id === id)?.text}</span>)}</div>}{reveal && !wasCorrect && question.type === "matching" && <div className="correct-solution"><b>Correct matches</b>{question.left_items.map((left, index) => <span key={index}>{left.text} → {question.right_items.find(item => item.id === reveal.correct_matches[index])?.text}</span>)}</div>}{!reveal && <div className="submit-zone"><Button onClick={submit} disabled={!complete || submitted || expired}>{submitted ? <><Check />Answer locked</> : expired ? "Time is up" : question.type === "matching" ? "Lock matches" : question.type === "order" ? "Lock order" : question.type === "multi" ? "Lock answers" : "Lock answer"}</Button>{notice && <span>{notice}</span>}</div>}</>}
       {reveal && <div className={`feedback-banner ${wasCorrect ? "right" : "wrong"}`}><div>{wasCorrect ? <Check /> : <X />}</div><span><b>{wasCorrect ? "Correct!" : "Not this time"}</b>{wasCorrect ? `+${(me.current_result?.points_awarded || 0).toLocaleString()} points` : `Score: ${(me.score || 0).toLocaleString()}`}</span><AutoAdvance nextAt={reveal.next_at} fallback={reveal.next_in_sec || 6} final={(session.current_question_index ?? 0) + 1 >= session.question_count} /></div>}
-    </main></div>;
+    </main><ReactionComposer socket={socket} connected={connected} notice={reactionNotice} /></div>;
 }
 
 function Results() {

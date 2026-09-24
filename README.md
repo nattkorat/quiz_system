@@ -18,7 +18,7 @@ The initial instructor name, email, and password come from `.env`. Set strong de
 1. Sign in, create a course folder, and share it with other registered instructors by email when needed.
 2. Select **New quiz**. Choose its folder, then build single-choice, multiple-choice, drag-to-order, or matching-pair questions with 2–6 items, time, and points.
 3. Find quizzes by folder, title, course tag, or instructor. Any instructor with folder access can select **Review** to inspect all questions and correct answers, then **Play** and share the 6-digit PIN, link, or QR code.
-4. Students open `/join`, enter the PIN, their name, and optional student ID.
+4. Students open `/join`, enter the PIN, their name, and optional student ID. They can still join while a quiz is already live.
 5. Start the quiz. The server reveals results when everyone answers or time expires, then advances automatically after the result screen.
 6. At the end, export XLSX or CSV. The file includes each question result, total correct, accuracy, score, and rank.
 7. Open **Stats** in session history for question analysis and the leaderboard, or re-export XLSX/CSV later.
@@ -29,6 +29,8 @@ Student reconnect tokens are kept in that device's browser. Refreshing the playe
 Instructor sound effects and original background quiz music are controlled separately from the presenter bar. Music starts only after the instructor clicks its control because browsers block automatic audio.
 
 While answers are open, the presenter sees only the total response count; per-option counts stay hidden until reveal. A short sound plays for every accepted answer when instructor SFX is enabled.
+
+Students can send approved emoji reactions or short chat messages from the lobby and live quiz. Reactions appear as temporary floating overlays for the whole room and are rate-limited by the server.
 
 Played quiz definitions are locked so later editing cannot change historical results. Create a new quiz version when you need different questions.
 
