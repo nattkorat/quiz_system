@@ -1,4 +1,4 @@
-const API = import.meta.env.VITE_API_URL || "/api";
+const API = (import.meta.env.VITE_API_URL || "/api").replace(/\/+$/, "");
 
 export const getToken = () => localStorage.getItem("quizforge_token");
 export const setAuth = (data) => {
@@ -28,7 +28,7 @@ export async function api(path, options = {}) {
 }
 
 export function socketUrl(sessionId, params) {
-  const base = import.meta.env.VITE_WS_URL || `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`;
+  const base = (import.meta.env.VITE_WS_URL || `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`).replace(/\/+$/, "");
   return `${base}/ws/sessions/${sessionId}?${new URLSearchParams(params)}`;
 }
 
@@ -43,4 +43,3 @@ export async function downloadExport(sessionId, format) {
   link.href = url; link.download = filename; link.click();
   URL.revokeObjectURL(url);
 }
-

@@ -23,15 +23,31 @@ services:
       DEFAULT_INSTRUCTOR_PASSWORD: ${DEFAULT_INSTRUCTOR_PASSWORD:?Set DEFAULT_INSTRUCTOR_PASSWORD in .env}
       RESULT_DISPLAY_SECONDS: ${RESULT_DISPLAY_SECONDS:?Set RESULT_DISPLAY_SECONDS in .env}
       CORS_ORIGINS: ${CORS_ORIGINS:?Set CORS_ORIGINS in .env}
+      CORS_ORIGIN_REGEX: ${CORS_ORIGIN_REGEX:-}
+      ALLOW_PUBLIC_REGISTRATION: ${ALLOW_PUBLIC_REGISTRATION:?Set ALLOW_PUBLIC_REGISTRATION in .env}
+      PASSWORD_RESET_ENABLED: ${PASSWORD_RESET_ENABLED:?Set PASSWORD_RESET_ENABLED in .env}
+      PASSWORD_RESET_BASE_URL: ${PASSWORD_RESET_BASE_URL:-}
+      PASSWORD_RESET_EXPIRE_MINUTES: ${PASSWORD_RESET_EXPIRE_MINUTES:-30}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_SECURITY: ${SMTP_SECURITY:-starttls}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-}
     depends_on:
       db:
         condition: service_healthy
     restart: unless-stopped
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:?Set VITE_API_URL in .env}
+        VITE_WS_URL: ${VITE_WS_URL:-}
+        VITE_ALLOW_REGISTRATION: ${VITE_ALLOW_REGISTRATION:?Set VITE_ALLOW_REGISTRATION in .env}
     ports:
-      - "8080:80"
+      - "127.0.0.1:${APP_PORT:?Set APP_PORT in .env}:80"
     depends_on:
       - backend
     restart: unless-stopped

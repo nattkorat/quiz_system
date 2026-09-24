@@ -16,7 +16,7 @@ The initial instructor name, email, and password come from `.env`. Set strong de
 ## Classroom workflow
 
 1. Sign in, create a course folder, and share it with other registered instructors by email when needed.
-2. Select **New quiz**. Choose its folder, then add a title, course tag, questions, 2–6 options, correct answer(s), time, and points.
+2. Select **New quiz**. Choose its folder, then build single-choice, multiple-choice, drag-to-order, or matching-pair questions with 2–6 items, time, and points.
 3. Find quizzes by folder, title, course tag, or instructor. Any instructor with folder access can select **Review** to inspect all questions and correct answers, then **Play** and share the 6-digit PIN, link, or QR code.
 4. Students open `/join`, enter the PIN, their name, and optional student ID.
 5. Start the quiz. The server reveals results when everyone answers or time expires, then advances automatically after the result screen.
@@ -68,7 +68,7 @@ The frontend reads its API, WebSocket, and local proxy addresses from the root `
 - WebSocket room: `/ws/sessions/{session_id}`
 - Health check: `/api/health`
 
-Correctness and response time are computed on the server. Correct responses receive the question's base points multiplied by a linear speed factor from `1.0` down to `0.5`. Duplicate and late answers are rejected.
+Correctness and response time are computed on the server. Ordering and matching items are shuffled per game without sending the solution before reveal. Correct responses receive the question's base points multiplied by a linear speed factor from `1.0` down to `0.5`. Duplicate and late answers are rejected.
 
 `RESULT_DISPLAY_SECONDS` controls how long the per-question result remains visible before the server advances. The default is six seconds.
 
@@ -84,3 +84,5 @@ npm run build
 ## Deployment notes
 
 The containers are single-node ready and keep all HTTP/WebSocket traffic behind the frontend Nginx service. For multi-replica deployment, replace the in-process WebSocket room manager with Redis pub/sub and use a shared PostgreSQL database.
+
+For a complete Docker Compose deployment on port 9090 through your Cloudflare domain, follow [DEPLOYMENT.md](DEPLOYMENT.md).

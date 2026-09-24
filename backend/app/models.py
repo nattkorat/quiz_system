@@ -76,6 +76,7 @@ class Question(Base):
     text: Mapped[str] = mapped_column(Text)
     type: Mapped[str] = mapped_column(String(16), default="single")
     options: Mapped[list[str]] = mapped_column(JSON)
+    match_options: Mapped[list[str] | None] = mapped_column(JSON, nullable=True, default=list)
     correct_options: Mapped[list[int]] = mapped_column(JSON)
     time_limit_sec: Mapped[int] = mapped_column(Integer, default=20)
     points: Mapped[int] = mapped_column(Integer, default=1000)

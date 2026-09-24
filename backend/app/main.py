@@ -8,7 +8,7 @@ import secrets
 from contextlib import asynccontextmanager
 from datetime import timedelta
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -16,19 +16,21 @@ from sqlalchemy import delete, func, inspect, or_, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from .auth import create_token, current_user, decode_user_id, hash_password, verify_password
-from .config import CORS_ORIGINS, DEFAULT_INSTRUCTOR_EMAIL, DEFAULT_INSTRUCTOR_NAME, DEFAULT_INSTRUCTOR_PASSWORD, RESULT_DISPLAY_SECONDS
+from .auth import create_password_reset_token, create_token, current_user, decode_password_reset_token, decode_user_id, hash_password, password_fingerprint, verify_password
+from .config import ALLOW_PUBLIC_REGISTRATION, CORS_ORIGINS, CORS_ORIGIN_REGEX, DEFAULT_INSTRUCTOR_EMAIL, DEFAULT_INSTRUCTOR_NAME, DEFAULT_INSTRUCTOR_PASSWORD, PASSWORD_RESET_BASE_URL, PASSWORD_RESET_ENABLED, PASSWORD_RESET_EXPIRE_MINUTES, RESULT_DISPLAY_SECONDS
 from .database import Base, SessionLocal, engine, get_db
+from .mailer import send_password_reset_email
 from .models import Answer, CourseFolder, FolderMember, GameSession, Participant, Question, Quiz, User, utcnow
 from .realtime import Client, manager
-from .schemas import FolderIn, FolderMemberIn, JoinIn, LoginIn, QuizIn, RegisterIn
-from .services import answer_distribution, iso, leaderboard, question_payload, reveal_payload, session_snapshot
+from .schemas import FolderIn, FolderMemberIn, ForgotPasswordIn, JoinIn, LoginIn, QuizIn, RegisterIn, ResetPasswordIn
+from .services import answer_distribution, expected_submission, iso, leaderboard, question_payload, reveal_payload, session_snapshot
 
 
 def initialize_database():
     Base.metadata.create_all(engine)
     schema = inspect(engine)
     quiz_columns = {column["name"] for column in schema.get_columns("quizzes")}
+    question_columns = {column["name"] for column in schema.get_columns("questions")}
     session_columns = {column["name"] for column in schema.get_columns("sessions")}
     with engine.begin() as connection:
         if "folder_id" not in quiz_columns:
@@ -37,6 +39,8 @@ def initialize_database():
             connection.execute(text("ALTER TABLE quizzes ADD COLUMN deleted_at DATETIME"))
         if "host_id" not in session_columns:
             connection.execute(text("ALTER TABLE sessions ADD COLUMN host_id INTEGER"))
+        if "match_options" not in question_columns:
+            connection.execute(text("ALTER TABLE questions ADD COLUMN match_options JSON"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS idx_quizzes_folder_id ON quizzes (folder_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS idx_quizzes_deleted_at ON quizzes (deleted_at)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS idx_sessions_host_id ON sessions (host_id)"))
@@ -73,7 +77,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="QuizForge API", version="1.0.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_origin_regex=CORS_ORIGIN_REGEX, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 
 @app.get("/api/health")
@@ -83,6 +87,8 @@ def health():
 
 @app.post("/api/auth/register", status_code=201)
 def register(body: RegisterIn, db: Session = Depends(get_db)):
+    if not ALLOW_PUBLIC_REGISTRATION:
+        raise HTTPException(403, "Instructor registration is disabled")
     if db.scalar(select(User).where(User.email == body.email.lower())):
         raise HTTPException(409, "Email already registered")
     user = User(name=body.name.strip(), email=body.email.lower(), password_hash=hash_password(body.password))
@@ -100,10 +106,33 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
     return {"access_token": create_token(user), "user": {"id": user.id, "name": user.name, "email": user.email}}
 
 
+@app.post("/api/auth/forgot-password")
+def forgot_password(body: ForgotPasswordIn, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    if not PASSWORD_RESET_ENABLED:
+        raise HTTPException(503, "Password reset email is not configured. Contact your administrator.")
+    user = db.scalar(select(User).where(User.email == body.email.lower()))
+    if user:
+        token = create_password_reset_token(user, PASSWORD_RESET_EXPIRE_MINUTES)
+        reset_url = f"{PASSWORD_RESET_BASE_URL}/reset-password?token={token}"
+        background_tasks.add_task(send_password_reset_email, user.email, reset_url)
+    return {"message": "If that instructor account exists, a reset link has been sent."}
+
+
+@app.post("/api/auth/reset-password")
+def reset_password(body: ResetPasswordIn, db: Session = Depends(get_db)):
+    user_id, expected_fingerprint = decode_password_reset_token(body.token)
+    user = db.get(User, user_id)
+    if not user or not secrets.compare_digest(password_fingerprint(user.password_hash), expected_fingerprint):
+        raise HTTPException(400, "This password reset link is invalid or has already been used")
+    user.password_hash = hash_password(body.password)
+    db.commit()
+    return {"message": "Password updated"}
+
+
 def serialize_quiz(quiz: Quiz, include_answers: bool = True, viewer_id: int | None = None) -> dict:
     questions = []
     for q in quiz.questions:
-        item = {"id": q.id, "position": q.position, "text": q.text, "type": q.type, "options": q.options, "time_limit_sec": q.time_limit_sec, "points": q.points}
+        item = {"id": q.id, "position": q.position, "text": q.text, "type": q.type, "options": q.options, "match_options": q.match_options or [], "time_limit_sec": q.time_limit_sec, "points": q.points}
         if include_answers:
             item["correct_options"] = q.correct_options
         questions.append(item)
@@ -190,8 +219,6 @@ def validate_quiz(body: QuizIn):
         valid = set(range(len(question.options)))
         if not set(question.correct_options).issubset(valid):
             raise HTTPException(422, f"Question {index + 1} has an invalid correct option")
-        if question.type == "single" and len(question.correct_options) != 1:
-            raise HTTPException(422, f"Question {index + 1} must have exactly one correct option")
 
 
 @app.get("/api/instructors")
@@ -551,7 +578,9 @@ def session_statistics(session_id: int, user: User = Depends(current_user), db: 
                 "id": question.id,
                 "position": question.position,
                 "text": question.text,
+                "type": question.type,
                 "options": question.options,
+                "match_options": question.match_options or [],
                 "correct_options": question.correct_options,
                 "distribution": answer_distribution(db, game, question),
                 "response_count": len(question_answers),
@@ -757,12 +786,21 @@ async def websocket_session(websocket: WebSocket, session_id: int, participant_t
             if not game.question_started_at or not game.question_deadline_at or now > game.question_deadline_at:
                 await manager.send(websocket, {"type": "answer_rejected", "message": "Time is up"})
                 continue
-            selected = sorted(set(int(i) for i in data.get("selected_options", [])))
-            if not selected or any(i < 0 or i >= len(question.options) for i in selected) or (question.type == "single" and len(selected) != 1):
+            try:
+                submitted = [int(i) for i in data.get("selected_options", [])]
+            except (TypeError, ValueError):
+                submitted = []
+            if question.type in {"order", "matching"}:
+                selected = submitted
+                valid_answer = len(selected) == len(question.options) and sorted(selected) == list(range(len(question.options)))
+            else:
+                selected = sorted(set(submitted))
+                valid_answer = bool(selected) and all(0 <= i < len(question.options) for i in selected) and (question.type != "single" or len(selected) == 1)
+            if not valid_answer:
                 await manager.send(websocket, {"type": "answer_rejected", "message": "Invalid answer selection"})
                 continue
             elapsed_ms = max(0, int((now - game.question_started_at).total_seconds() * 1000))
-            is_correct = selected == sorted(question.correct_options)
+            is_correct = selected == expected_submission(game, question)
             limit_ms = question.time_limit_sec * 1000
             speed_factor = max(0.5, 1.0 - 0.5 * min(elapsed_ms / limit_ms, 1.0))
             points = round(question.points * speed_factor) if is_correct else 0

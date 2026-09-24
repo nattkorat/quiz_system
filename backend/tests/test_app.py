@@ -9,11 +9,16 @@ os.environ["DEFAULT_INSTRUCTOR_NAME"] = "Test Instructor"
 os.environ["DEFAULT_INSTRUCTOR_EMAIL"] = "default@example.com"
 os.environ["DEFAULT_INSTRUCTOR_PASSWORD"] = "strong-default-password"
 os.environ["CORS_ORIGINS"] = "http://localhost:5173"
+os.environ["CORS_ORIGIN_REGEX"] = ""
+os.environ["ALLOW_PUBLIC_REGISTRATION"] = "true"
+os.environ["PASSWORD_RESET_ENABLED"] = "false"
 
 from fastapi.testclient import TestClient
 
-from app.database import Base, engine
+from app.database import Base, SessionLocal, engine
+from app import main as main_module
 from app.main import app
+from app.services import expected_submission, get_full_session, question_payload, reveal_payload
 
 
 def setup_function():
@@ -65,6 +70,62 @@ def test_rejects_invalid_correct_option():
         quiz["questions"][0]["correct_options"] = [4]
         response = client.post("/api/quizzes", json=quiz, headers=headers)
         assert response.status_code == 422
+
+
+def test_order_and_matching_questions_use_shuffled_public_ids():
+    quiz_body = {
+        "title": "Interactive quiz",
+        "course_tag": "UX-101",
+        "questions": [
+            {"text": "Put these in order", "type": "order", "options": ["Plan", "Build", "Test"], "correct_options": [], "time_limit_sec": 20, "points": 1000},
+            {"text": "Match the capitals", "type": "matching", "options": ["Cambodia", "Japan"], "match_options": ["Phnom Penh", "Tokyo"], "correct_options": [], "time_limit_sec": 20, "points": 1000},
+        ],
+    }
+    with TestClient(app) as client:
+        headers = auth(client)
+        created = client.post("/api/quizzes", json=quiz_body, headers=headers)
+        assert created.status_code == 201
+        assert created.json()["questions"][1]["match_options"] == ["Phnom Penh", "Tokyo"]
+        game_data = client.post(f"/api/quizzes/{created.json()['id']}/sessions", headers=headers).json()
+
+        with SessionLocal() as db:
+            game = get_full_session(db, game_data["id"])
+            order_question, matching_question = game.quiz.questions
+            order_public = question_payload(game, order_question)
+            matching_public = question_payload(game, matching_question)
+
+            assert "options" not in order_public
+            assert "match_options" not in matching_public
+            assert [item["text"] for item in order_public["items"]] != order_question.options
+            assert expected_submission(game, order_question) == [next(item["id"] for item in order_public["items"] if item["text"] == text) for text in order_question.options]
+            assert expected_submission(game, matching_question) == [next(item["id"] for item in matching_public["right_items"] if item["text"] == text) for text in matching_question.match_options]
+            assert reveal_payload(db, game, order_question)["correct_sequence"] == expected_submission(game, order_question)
+            assert reveal_payload(db, game, matching_question)["correct_matches"] == expected_submission(game, matching_question)
+
+        invalid_order = {**quiz_body, "questions": [{**quiz_body["questions"][0], "options": ["One", "Two"]}]}
+        invalid_matching = {**quiz_body, "questions": [{**quiz_body["questions"][1], "match_options": ["Only one"]}]}
+        assert client.post("/api/quizzes", json=invalid_order, headers=headers).status_code == 422
+        assert client.post("/api/quizzes", json=invalid_matching, headers=headers).status_code == 422
+
+
+def test_password_reset_is_generic_single_use_and_changes_password(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(main_module, "PASSWORD_RESET_ENABLED", True)
+    monkeypatch.setattr(main_module, "PASSWORD_RESET_BASE_URL", "https://quiz.example.com")
+    monkeypatch.setattr(main_module, "send_password_reset_email", lambda recipient, url: captured.update({"recipient": recipient, "url": url}))
+    with TestClient(app) as client:
+        register(client, "Reset Teacher", "reset@example.com")
+        requested = client.post("/api/auth/forgot-password", json={"email": "reset@example.com"})
+        unknown = client.post("/api/auth/forgot-password", json={"email": "unknown@example.com"})
+        assert requested.status_code == 200
+        assert requested.json() == unknown.json()
+        assert captured["recipient"] == "reset@example.com"
+        token = captured["url"].split("token=", 1)[1]
+        changed = client.post("/api/auth/reset-password", json={"token": token, "password": "new-strong-password"})
+        assert changed.status_code == 200
+        assert client.post("/api/auth/login", json={"email": "reset@example.com", "password": "strong-pass"}).status_code == 401
+        assert client.post("/api/auth/login", json={"email": "reset@example.com", "password": "new-strong-password"}).status_code == 200
+        assert client.post("/api/auth/reset-password", json={"token": token, "password": "another-password"}).status_code == 400
 
 
 def test_websocket_answer_is_scored_and_broadcast():

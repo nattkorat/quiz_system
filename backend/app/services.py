@@ -1,3 +1,4 @@
+import random
 from datetime import datetime
 
 from sqlalchemy import Integer, cast, func, select
@@ -66,20 +67,48 @@ def session_snapshot(db: Session, game: GameSession, participant_id: int | None 
 
 
 def question_payload(game: GameSession, question: Question) -> dict:
-    return {
+    payload = {
         "id": question.id,
         "position": question.position,
         "text": question.text,
         "type": question.type,
-        "options": question.options,
         "duration_sec": question.time_limit_sec,
         "points": question.points,
         "server_start_time": iso(game.question_started_at),
         "deadline": iso(game.question_deadline_at),
     }
+    if question.type == "order":
+        order = interaction_permutation(game, question)
+        payload["items"] = [{"id": display_id, "text": question.options[original_id]} for display_id, original_id in enumerate(order)]
+    elif question.type == "matching":
+        order = interaction_permutation(game, question)
+        right = question.match_options or []
+        payload["left_items"] = [{"id": index, "text": text} for index, text in enumerate(question.options)]
+        payload["right_items"] = [{"id": display_id, "text": right[original_id]} for display_id, original_id in enumerate(order)]
+    else:
+        payload["options"] = question.options
+    return payload
+
+
+def interaction_permutation(game: GameSession, question: Question) -> list[int]:
+    order = list(range(len(question.options)))
+    random.Random(f"quizforge:{game.id}:{question.id}").shuffle(order)
+    if len(order) > 1 and order == list(range(len(order))):
+        order = order[1:] + order[:1]
+    return order
+
+
+def expected_submission(game: GameSession, question: Question) -> list[int]:
+    if question.type in {"single", "multi"}:
+        return sorted(question.correct_options)
+    permutation = interaction_permutation(game, question)
+    display_id_by_original = {original_id: display_id for display_id, original_id in enumerate(permutation)}
+    return [display_id_by_original[original_id] for original_id in range(len(question.options))]
 
 
 def answer_distribution(db: Session, game: GameSession, question: Question) -> list[int]:
+    if question.type not in {"single", "multi"}:
+        return []
     distribution = [0] * len(question.options)
     answers = db.scalars(select(Answer).where(Answer.session_id == game.id, Answer.question_id == question.id)).all()
     for answer in answers:
@@ -115,9 +144,15 @@ def leaderboard(db: Session, session_id: int, update_ranks: bool = True) -> list
 
 def reveal_payload(db: Session, game: GameSession, question: Question) -> dict:
     total = db.scalar(select(func.count(Answer.id)).where(Answer.session_id == game.id, Answer.question_id == question.id)) or 0
-    return {
+    payload = {
         "question_id": question.id,
+        "question_type": question.type,
         "correct_options": question.correct_options,
         "distribution": answer_distribution(db, game, question),
         "response_count": total,
     }
+    if question.type == "order":
+        payload["correct_sequence"] = expected_submission(game, question)
+    elif question.type == "matching":
+        payload["correct_matches"] = expected_submission(game, question)
+    return payload

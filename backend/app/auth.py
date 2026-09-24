@@ -35,12 +35,38 @@ def verify_password(password: str, encoded: str) -> bool:
 
 def create_token(user: User) -> str:
     now = datetime.now(timezone.utc)
-    return jwt.encode({"sub": str(user.id), "email": user.email, "iat": now, "exp": now + timedelta(hours=12)}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return jwt.encode({"sub": str(user.id), "email": user.email, "type": "access", "iat": now, "exp": now + timedelta(hours=12)}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def password_fingerprint(password_hash: str) -> str:
+    return hashlib.sha256(password_hash.encode()).hexdigest()[:24]
+
+
+def create_password_reset_token(user: User, expire_minutes: int) -> str:
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {"sub": str(user.id), "type": "password_reset", "pwd": password_fingerprint(user.password_hash), "iat": now, "exp": now + timedelta(minutes=expire_minutes)},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def decode_password_reset_token(token: str) -> tuple[int, str]:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type") != "password_reset" or not payload.get("pwd"):
+            raise ValueError
+        return int(payload["sub"]), str(payload["pwd"])
+    except (jwt.PyJWTError, KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="This password reset link is invalid or expired") from exc
 
 
 def decode_user_id(token: str) -> int:
     try:
-        return int(jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])["sub"])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        if payload.get("type", "access") != "access":
+            raise ValueError
+        return int(payload["sub"])
     except (jwt.PyJWTError, KeyError, ValueError) as exc:
         raise HTTPException(status_code=401, detail="Invalid or expired token") from exc
 
