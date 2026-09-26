@@ -105,6 +105,8 @@ For production capacity, run it from a separate machine against the public Cloud
 
 Each game accepts at most 150 students by default. Set `MAX_PARTICIPANTS_PER_SESSION` to change the limit; reconnecting students can still resume when the game is full.
 
+An instructor lobby that is created but never started automatically closes after two hours, including across backend restarts. Set `PENDING_SESSION_EXPIRE_HOURS` to change this period. Active quizzes still finish through their normal question timers, and completed sessions remain in history.
+
 ## Backend modules
 
 - `app/main.py` assembles the application and routers.

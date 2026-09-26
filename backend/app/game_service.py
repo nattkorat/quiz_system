@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from .config import MAX_PARTICIPANTS_PER_SESSION, RESULT_DISPLAY_SECONDS
+from .config import MAX_PARTICIPANTS_PER_SESSION, PENDING_SESSION_EXPIRE_HOURS, RESULT_DISPLAY_SECONDS
 from .database import SessionLocal
 from .models import Answer, GameSession, Quiz, utcnow
 from .realtime import manager
@@ -82,6 +82,21 @@ def schedule_advance(session_id: int, question_id: int):
     manager.set_task(session_id, "advance", auto_advance(session_id, question_id, RESULT_DISPLAY_SECONDS))
 
 
+def schedule_lobby_expiry(session_id: int, delay: float | None = None):
+    seconds = PENDING_SESSION_EXPIRE_HOURS * 3600 if delay is None else delay
+    manager.set_task(session_id, "lobby_expiry", auto_expire_lobby(session_id, seconds))
+
+
+async def auto_expire_lobby(session_id: int, delay: float):
+    await asyncio.sleep(max(0, delay))
+    async with manager.lock(session_id):
+        with SessionLocal() as db:
+            game = load_session(db, session_id)
+            if not game or game.status != "pending":
+                return
+            await finish_game(db, game)
+
+
 async def auto_reveal(session_id: int, question_id: int, delay: float):
     await asyncio.sleep(max(0, delay))
     async with manager.lock(session_id):
@@ -108,6 +123,7 @@ async def auto_advance(session_id: int, question_id: int, delay: float):
 
 
 async def begin_question(db: Session, game: GameSession, index: int):
+    manager.cancel_task(game.id, "lobby_expiry")
     manager.cancel_task(game.id, "advance")
     now = utcnow()
     question = game.quiz.questions[index]

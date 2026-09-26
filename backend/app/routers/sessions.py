@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, selectinload
 from ..auth import current_user
 from ..config import MAX_PARTICIPANTS_PER_SESSION
 from ..database import get_db
-from ..game_service import accessible_session, advance_game, begin_question, finish_game, hosted_session, new_pin, reveal_game, session_json
+from ..game_service import accessible_session, advance_game, begin_question, finish_game, hosted_session, new_pin, reveal_game, schedule_lobby_expiry, session_json
 from ..models import GameSession, Participant, Quiz, User, utcnow
 from ..quiz_service import accessible_quiz
 from ..realtime import manager
@@ -21,7 +21,7 @@ router = APIRouter(prefix="/api", tags=["game sessions"])
 
 
 @router.post("/quizzes/{quiz_id}/sessions", status_code=201)
-def create_session(quiz_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+async def create_session(quiz_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
     quiz = accessible_quiz(db, quiz_id, user.id)
     if not quiz.questions:
         raise HTTPException(422, "Add at least one question before launching")
@@ -29,6 +29,7 @@ def create_session(quiz_id: int, user: User = Depends(current_user), db: Session
     db.add(game)
     db.commit()
     db.refresh(game)
+    schedule_lobby_expiry(game.id)
     return session_json(game)
 
 

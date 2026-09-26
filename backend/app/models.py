@@ -134,6 +134,7 @@ class GameSession(Base):
     host_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True, index=True)
     pin: Mapped[str] = mapped_column(String(6), unique=True, index=True)
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     current_question_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     question_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     question_deadline_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

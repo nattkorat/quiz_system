@@ -1,15 +1,16 @@
 """Application startup, schema compatibility, and task restoration."""
 
 from contextlib import asynccontextmanager
+from datetime import timedelta
 
 from fastapi import FastAPI
 from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import selectinload
 
 from .auth import hash_password
-from .config import DEFAULT_INSTRUCTOR_EMAIL, DEFAULT_INSTRUCTOR_NAME, DEFAULT_INSTRUCTOR_PASSWORD
+from .config import DEFAULT_INSTRUCTOR_EMAIL, DEFAULT_INSTRUCTOR_NAME, DEFAULT_INSTRUCTOR_PASSWORD, PENDING_SESSION_EXPIRE_HOURS
 from .database import Base, SessionLocal, engine
-from .game_service import schedule_advance, schedule_reveal
+from .game_service import schedule_advance, schedule_lobby_expiry, schedule_reveal
 from .models import GameSession, Quiz, User, utcnow
 from .realtime import manager
 
@@ -38,11 +39,15 @@ def initialize_database():
             connection.execute(text("ALTER TABLE quizzes ADD COLUMN deleted_at DATETIME"))
         if "host_id" not in session_columns:
             connection.execute(text("ALTER TABLE sessions ADD COLUMN host_id INTEGER"))
+        if "created_at" not in session_columns:
+            connection.execute(text(f"ALTER TABLE sessions ADD COLUMN created_at {timestamp_type}"))
+            connection.execute(text("UPDATE sessions SET created_at = CURRENT_TIMESTAMP WHERE created_at IS NULL"))
         if "match_options" not in question_columns:
             connection.execute(text("ALTER TABLE questions ADD COLUMN match_options JSON"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS idx_quizzes_folder_id ON quizzes (folder_id)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS idx_quizzes_deleted_at ON quizzes (deleted_at)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS idx_sessions_host_id ON sessions (host_id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS idx_sessions_created_at ON sessions (created_at)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS idx_users_is_admin ON users (is_admin)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS idx_users_is_active ON users (is_active)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS idx_users_last_login_at ON users (last_login_at)"))
@@ -72,10 +77,14 @@ async def lifespan(_app: FastAPI):
     with SessionLocal() as db:
         active = db.scalars(
             select(GameSession)
-            .where(GameSession.status == "live")
+            .where(GameSession.status.in_(("pending", "live")))
             .options(selectinload(GameSession.quiz).selectinload(Quiz.questions))
         ).all()
         for game in active:
+            if game.status == "pending":
+                expires_at = game.created_at + timedelta(hours=PENDING_SESSION_EXPIRE_HOURS)
+                schedule_lobby_expiry(game.id, max(0.0, (expires_at - utcnow()).total_seconds()))
+                continue
             if game.current_question_index is None:
                 continue
             question = game.quiz.questions[game.current_question_index]

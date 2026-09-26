@@ -18,6 +18,7 @@ os.environ["PASSWORD_RESET_ENABLED"] = "false"
 from fastapi.testclient import TestClient
 
 from app.database import Base, SessionLocal, engine
+from app.game_service import auto_expire_lobby
 from app.main import app
 from app.routers import auth as auth_router
 from app.routers import sessions as sessions_router
@@ -114,6 +115,21 @@ def test_quiz_session_join_and_export():
         assert export.status_code == 200
         assert "Student Name,Student ID,Q1" in export.text
         assert "Sokha,S001,0" in export.text
+
+
+def test_abandoned_pending_lobby_auto_expires():
+    with TestClient(app) as client:
+        headers = auth(client)
+        quiz_id = client.post("/api/quizzes", json=sample_quiz(), headers=headers).json()["id"]
+        game = client.post(f"/api/quizzes/{quiz_id}/sessions", headers=headers).json()
+        assert game["status"] == "pending"
+
+        client.portal.call(auto_expire_lobby, game["id"], 0)
+
+        expired = client.get(f"/api/sessions/{game['id']}", headers=headers)
+        assert expired.status_code == 200
+        assert expired.json()["session"]["status"] == "ended"
+        assert client.post("/api/sessions/join", json={"pin": game["pin"], "display_name": "Late Student"}).status_code == 404
 
 
 def test_rejects_invalid_correct_option():
