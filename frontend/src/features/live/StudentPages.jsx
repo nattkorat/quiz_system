@@ -1,0 +1,69 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Navigate, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { ArrowRight, Check, ChevronDown, ChevronUp, Clock3, GripVertical, Radio, X } from "lucide-react";
+import { api } from "../../api";
+import { palette } from "../../shared/constants";
+import { Brand, Button, ErrorBox, Loader } from "../../shared/ui";
+import { AutoAdvance, Leaderboard, ReactionComposer, ReactionLayer } from "./components";
+import { useFloatingReactions, useLiveSocket } from "./hooks";
+
+export function JoinPage() {
+  const navigate = useNavigate(); const [params] = useSearchParams();
+  const [form, setForm] = useState({ pin: params.get("pin") || "", display_name: "", student_id: "" }); const [error, setError] = useState(""); const [busy, setBusy] = useState(false);
+  async function submit(event) { event.preventDefault(); setBusy(true); setError(""); try { const result = await api("/sessions/join", { method: "POST", body: JSON.stringify(form) }); localStorage.setItem(`quizforge_player_${result.session_id}`, result.resume_token); navigate(`/play/${result.session_id}`); } catch (requestError) { setError(requestError.message); } finally { setBusy(false); } }
+  return <div className="join-page"><div className="join-glow" /><div className="join-card"><Brand /><div className="join-icon"><Radio /></div><p className="eyebrow">JOIN LIVE QUIZ</p><h1>Ready to play?</h1><p className="muted">Enter the code on the classroom screen. Late? You can still join while the quiz is live.</p><form onSubmit={submit}><ErrorBox error={error} /><label>Game PIN<input inputMode="numeric" pattern="[0-9]*" maxLength={6} value={form.pin} onChange={event => setForm({ ...form, pin: event.target.value.replace(/\D/g, "") })} placeholder="000000" className="pin-input" required /></label><label>Your name<input value={form.display_name} maxLength={80} onChange={event => setForm({ ...form, display_name: event.target.value })} placeholder="Sokha" required /></label><label>Student ID <span>optional</span><input value={form.student_id} onChange={event => setForm({ ...form, student_id: event.target.value })} placeholder="e.g. 20260042" /></label><Button disabled={busy || form.pin.length < 4}>{busy ? "Joining…" : "Join game"}<ArrowRight /></Button></form></div></div>;
+}
+
+export function PlayerPage() {
+  const { sessionId } = useParams(); const navigate = useNavigate(); const token = localStorage.getItem(`quizforge_player_${sessionId}`);
+  const [state, setState] = useState(null); const [selected, setSelected] = useState([]); const [submitted, setSubmitted] = useState(false); const [expired, setExpired] = useState(false); const [notice, setNotice] = useState(""); const [reactionNotice, setReactionNotice] = useState(""); const [dragIndex, setDragIndex] = useState(null); const socket = useRef(null);
+  const { reactions, addReaction } = useFloatingReactions();
+  const onMessage = useCallback((message, webSocket) => {
+    socket.current = webSocket;
+    if (message.type === "reaction") { addReaction(message); setReactionNotice(""); return; }
+    if (message.type === "reaction_rejected") { setReactionNotice(message.message); setTimeout(() => setReactionNotice(""), 1800); return; }
+    setState(previous => {
+      if (message.type === "snapshot") { const answered = Boolean(message.me?.answered); setSubmitted(answered); setSelected(answered ? message.me?.selected_options || [] : initialSelection(message.question)); setExpired(Boolean(message.session?.is_revealed) || (message.question?.deadline ? Date.now() >= new Date(message.question.deadline).getTime() : false)); return message; }
+      if (!previous) return previous;
+      if (message.type === "question_start") { setSelected(initialSelection(message.question)); setSubmitted(false); setExpired(false); setNotice(""); setDragIndex(null); return { ...previous, session: { ...previous.session, status: "live", is_revealed: false, current_question_index: message.question.position, question_count: message.question_count }, question: message.question, reveal: null, leaderboard: null, me: { ...previous.me, answered: false, selected_options: [], current_result: null } }; }
+      if (message.type === "answer_accepted") { setSubmitted(true); setNotice("Answer locked"); return { ...previous, me: { ...previous.me, score: message.score, answered: true } }; }
+      if (message.type === "answer_rejected") { setNotice(message.message); if (message.message === "Time is up") setExpired(true); return previous; }
+      if (message.type === "player_result") { setSelected(message.selected_options || []); return { ...previous, me: { ...previous.me, score: message.score, current_result: { is_correct: message.is_correct, points_awarded: message.points_awarded } } }; }
+      if (message.type === "question_reveal") { setExpired(true); return { ...previous, session: { ...previous.session, is_revealed: true }, reveal: message }; }
+      if (message.type === "leaderboard_update") return { ...previous, leaderboard: message.leaderboard };
+      if (message.type === "session_end") return { ...previous, session: { ...previous.session, status: "ended" }, leaderboard: message.leaderboard };
+      return previous;
+    });
+  }, [addReaction]);
+  const connected = useLiveSocket(sessionId, { participant_token: token || "" }, onMessage);
+  if (!token) return <Navigate to="/join" replace />;
+  if (!state) return <div className="player-page"><Loader label="Joining the room…" /></div>;
+  const { session, question, reveal, leaderboard = [], me = {} } = state; const safeLeaderboard = Array.isArray(leaderboard) ? leaderboard : [];
+  const myRow = safeLeaderboard.find(row => row.participant_id === Number(state.me?.participant_id)); const wasCorrect = Boolean(me.current_result?.is_correct);
+  const complete = question?.type === "matching" ? selected.length === (question.left_items?.length || 0) && selected.every(Number.isInteger) && new Set(selected).size === selected.length : question?.type === "order" ? selected.length === (question.items?.length || 0) : selected.length > 0;
+  function submit() { if (!complete || expired || !socket.current || socket.current.readyState !== WebSocket.OPEN) return; socket.current.send(JSON.stringify({ type: "answer_submitted", question_id: question.id, selected_options: selected })); }
+  if (session.status === "pending") return <div className="player-page waiting-room"><ReactionLayer reactions={reactions} /><div className="player-status"><Brand /><div className="ready-check"><Check /></div><p className="eyebrow">YOU’RE IN</p><h1>Eyes up front.</h1><p>Your instructor will start <b>{session.quiz_title}</b> soon.</p><span className={`connection ${connected ? "online" : ""}`}><i />{connected ? "Connected" : "Reconnecting"}</span></div><ReactionComposer socket={socket} connected={connected} notice={reactionNotice} /></div>;
+  if (session.status === "ended") return <div className="player-page result-page"><div className="result-card"><p className="eyebrow">FINAL RESULT</p><h1>{myRow ? `#${myRow.rank}` : "Finished"}</h1><h2>{myRow?.display_name || "Quiz complete"}</h2><div className="score-big">{(myRow?.score ?? me.score ?? 0).toLocaleString()}<span>points</span></div><Leaderboard rows={safeLeaderboard.slice(0, 5)} me={myRow?.participant_id} /><Button onClick={() => navigate("/join")}>Join another game</Button></div></div>;
+  return <div className="player-page play-surface"><ReactionLayer reactions={reactions} /><header className="player-bar"><span>Q{(session.current_question_index ?? 0) + 1}/{session.question_count}</span><strong>{session.quiz_title}</strong><span>{(me.score || 0).toLocaleString()} pts</span></header><main className="player-main">{question && <><div className="player-question"><Countdown deadline={question.deadline} onExpire={() => { setExpired(true); setNotice("Time is up — waiting for results"); }} /><h1>{question.text}</h1><p>{question.type === "multi" ? "Select all correct answers" : question.type === "order" ? "Drag the steps into the correct order" : question.type === "matching" ? "Match every item with its partner" : "Choose one answer"}</p></div><PlayerQuestionInput question={question} selected={selected} setSelected={setSelected} locked={submitted || expired || Boolean(reveal)} reveal={reveal} dragIndex={dragIndex} setDragIndex={setDragIndex} />{reveal && !wasCorrect && question.type === "order" && <div className="correct-solution"><b>Correct order</b>{reveal.correct_sequence.map((id, index) => <span key={id}>{index + 1}. {question.items.find(item => item.id === id)?.text}</span>)}</div>}{reveal && !wasCorrect && question.type === "matching" && <div className="correct-solution"><b>Correct matches</b>{question.left_items.map((left, index) => <span key={index}>{left.text} → {question.right_items.find(item => item.id === reveal.correct_matches[index])?.text}</span>)}</div>}{!reveal && <div className="submit-zone"><Button onClick={submit} disabled={!complete || submitted || expired}>{submitted ? <><Check />Answer locked</> : expired ? "Time is up" : question.type === "matching" ? "Lock matches" : question.type === "order" ? "Lock order" : question.type === "multi" ? "Lock answers" : "Lock answer"}</Button>{notice && <span>{notice}</span>}</div>}</>}{reveal && <div className={`feedback-banner ${wasCorrect ? "right" : "wrong"}`}><div>{wasCorrect ? <Check /> : <X />}</div><span><b>{wasCorrect ? "Correct!" : "Not this time"}</b>{wasCorrect ? `+${(me.current_result?.points_awarded || 0).toLocaleString()} points` : `Score: ${(me.score || 0).toLocaleString()}`}</span><AutoAdvance nextAt={reveal.next_at} fallback={reveal.next_in_sec || 6} final={(session.current_question_index ?? 0) + 1 >= session.question_count} /></div>}</main><ReactionComposer socket={socket} connected={connected} notice={reactionNotice} /></div>;
+}
+
+function Countdown({ deadline, onExpire }) {
+  const [left, setLeft] = useState(0); const expired = useRef(false); const expireCallback = useRef(onExpire); expireCallback.current = onExpire;
+  useEffect(() => { expired.current = false; const tick = () => { const remaining = Math.max(0, Math.ceil((new Date(deadline).getTime() - Date.now()) / 1000)); setLeft(remaining); if (remaining === 0 && !expired.current) { expired.current = true; expireCallback.current?.(); } }; tick(); const timer = setInterval(tick, 250); return () => clearInterval(timer); }, [deadline]);
+  return <span className={`countdown ${left <= 5 ? "urgent" : ""}`}><Clock3 />{left}s</span>;
+}
+
+function initialSelection(question) { if (question?.type === "order") return (question.items || []).map(item => item.id); if (question?.type === "matching") return Array(question.left_items?.length || 0).fill(null); return []; }
+
+function PlayerQuestionInput({ question, selected, setSelected, locked, reveal, dragIndex, setDragIndex }) {
+  if (question.type === "order") {
+    const itemById = new Map((question.items || []).map(item => [item.id, item]));
+    const moveItem = (from, to) => { if (locked || from === to || from < 0 || to < 0 || from >= selected.length || to >= selected.length) return; const next = [...selected]; const [item] = next.splice(from, 1); next.splice(to, 0, item); setSelected(next); };
+    return <div className="drag-order">{selected.map((id, index) => { const correct = reveal?.correct_sequence?.[index] === id; return <div className={`${correct ? "correct" : reveal ? "wrong" : ""}`} draggable={!locked} onDragStart={() => setDragIndex(index)} onDragOver={event => event.preventDefault()} onDrop={() => { moveItem(dragIndex, index); setDragIndex(null); }} key={id}><GripVertical /><span>{index + 1}</span><strong>{itemById.get(id)?.text}</strong><aside><button disabled={locked || index === 0} onClick={() => moveItem(index, index - 1)} aria-label="Move up"><ChevronUp /></button><button disabled={locked || index === selected.length - 1} onClick={() => moveItem(index, index + 1)} aria-label="Move down"><ChevronDown /></button></aside>{reveal && (correct ? <Check /> : <X />)}</div>; })}</div>;
+  }
+  if (question.type === "matching") {
+    const chooseMatch = (leftIndex, value) => { if (locked) return; const id = value === "" ? null : Number(value); const next = [...selected]; if (id !== null) next.forEach((chosen, index) => { if (index !== leftIndex && chosen === id) next[index] = null; }); next[leftIndex] = id; setSelected(next); };
+    return <div className="matching-play">{(question.left_items || []).map((left, index) => { const correct = reveal?.correct_matches?.[index] === selected[index]; return <label className={`${correct ? "correct" : reveal ? "wrong" : ""}`} key={index}><strong>{left.text}</strong><ArrowRight /><select value={selected[index] ?? ""} disabled={locked} onChange={event => chooseMatch(index, event.target.value)}><option value="">Choose a match…</option>{(question.right_items || []).map(item => <option value={item.id} key={item.id}>{item.text}</option>)}</select>{reveal && (correct ? <Check /> : <X />)}</label>; })}</div>;
+  }
+  return <div className="player-options">{(question.options || []).map((option, index) => { const isSelected = selected.includes(index); const isCorrect = reveal?.correct_options?.includes(index); const isWrong = reveal && isSelected && !isCorrect; return <button aria-pressed={isSelected} disabled={locked} onClick={() => { if (question.type === "single") setSelected([index]); else setSelected(current => current.includes(index) ? current.filter(item => item !== index) : [...current, index]); }} className={`${palette[index]} ${isSelected ? "selected" : ""} ${isCorrect ? "revealed-correct" : ""} ${isWrong ? "revealed-wrong" : ""}`} key={index}><span>{String.fromCharCode(65 + index)}</span><strong>{option}</strong>{(isSelected || isCorrect) && <i>{isWrong ? <X /> : <Check />}</i>}</button>; })}</div>;
+}

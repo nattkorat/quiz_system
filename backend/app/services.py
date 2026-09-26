@@ -4,6 +4,7 @@ from datetime import datetime
 from sqlalchemy import Integer, cast, func, select
 from sqlalchemy.orm import Session, selectinload
 
+from .config import MAX_PARTICIPANTS_PER_SESSION
 from .models import Answer, GameSession, Participant, Question, Quiz
 from .realtime import manager
 
@@ -32,6 +33,7 @@ def session_snapshot(db: Session, game: GameSession, participant_id: int | None 
             "current_question_index": game.current_question_index,
             "question_count": len(game.quiz.questions),
             "is_revealed": game.is_revealed,
+            "participant_limit": MAX_PARTICIPANTS_PER_SESSION,
         },
         "participants": [{"id": p.id, "display_name": p.display_name} for p in game.participants],
     }

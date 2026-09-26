@@ -9,15 +9,19 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Open [http://localhost:8080](http://localhost:8080).
+Open [http://localhost:9090](http://localhost:9090), or the port configured by `APP_PORT`.
 
 The initial instructor name, email, and password come from `.env`. Set strong deployment values for the instructor password, database password, and `JWT_SECRET` before starting the app.
 
+The initial instructor is also the platform administrator. Sign in with `DEFAULT_INSTRUCTOR_EMAIL`, then open **Admin** in the top navigation to view registration and usage totals, monitor open games, suspend/reactivate instructor accounts, generate manual password-reset links, or end an open game. Suspending an instructor preserves their quizzes and played-session history.
+
+Manual reset links do not require SMTP. Find the instructor by their registered email, select **Reset link**, then privately send the generated URL to that email owner. The link expires after `PASSWORD_RESET_EXPIRE_MINUTES` and becomes invalid immediately after the password changes.
+
 ## Classroom workflow
 
-1. Sign in, create a course folder, and share it with other registered instructors by email when needed.
+1. Sign in, create a course folder, and share it with other registered instructors by email or an expiring invitation link. Owners can rename, update, or delete folders and revoke active links.
 2. Select **New quiz**. Choose its folder, then build single-choice, multiple-choice, drag-to-order, or matching-pair questions with 2–6 items, time, and points.
-3. Find quizzes by folder, title, course tag, or instructor. Any instructor with folder access can select **Review** to inspect all questions and correct answers, then **Play** and share the 6-digit PIN, link, or QR code.
+3. Find quizzes by folder, title, course tag, or instructor. Any instructor with access can review, play, or copy a quiz into an independently editable version, then share the game PIN, link, or QR code.
 4. Students open `/join`, enter the PIN, their name, and optional student ID. They can still join while a quiz is already live.
 5. Start the quiz. The server reveals results when everyone answers or time expires, then advances automatically after the result screen.
 6. At the end, export XLSX or CSV. The file includes each question result, total correct, accuracy, score, and rank.
@@ -82,6 +86,32 @@ pytest
 cd ../frontend
 npm run build
 ```
+
+## Live load test
+
+The load test exercises the complete student flow: REST join, WebSocket connection, question broadcast, answer submission, and server acknowledgement. Use a dedicated test instructor and database because it creates temporary quiz sessions.
+
+```bash
+cd backend
+.venv/bin/python scripts/load_test.py \
+  --base-url http://127.0.0.1:8000 \
+  --email loadtest@example.com \
+  --password 'your-test-password' \
+  --students 25,50,100,150 \
+  --json-output /tmp/quizforge-load-report.json
+```
+
+For production capacity, run it from a separate machine against the public Cloudflare URL during a maintenance window. Local SQLite results are only a development baseline; the deployed PostgreSQL server, network, Cloudflare tunnel, CPU, and memory determine the real limit.
+
+Each game accepts at most 150 students by default. Set `MAX_PARTICIPANTS_PER_SESSION` to change the limit; reconnecting students can still resume when the game is full.
+
+## Backend modules
+
+- `app/main.py` assembles the application and routers.
+- `app/routers/` separates authentication, administration, quiz library, game sessions, reports, and live WebSockets.
+- `app/quiz_service.py` owns quiz/folder access rules and serialization.
+- `app/game_service.py` owns live-game state transitions and timers.
+- `app/lifecycle.py` owns startup, database initialization, and task restoration.
 
 ## Deployment notes
 

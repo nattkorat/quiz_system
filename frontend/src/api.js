@@ -1,9 +1,13 @@
 const API = (import.meta.env.VITE_API_URL || "/api").replace(/\/+$/, "");
 
 export const getToken = () => localStorage.getItem("quizforge_token");
+export const getUser = () => {
+  try { return JSON.parse(localStorage.getItem("quizforge_user") || "null"); } catch { return null; }
+};
+export const setUser = user => localStorage.setItem("quizforge_user", JSON.stringify(user));
 export const setAuth = (data) => {
   localStorage.setItem("quizforge_token", data.access_token);
-  localStorage.setItem("quizforge_user", JSON.stringify(data.user));
+  setUser(data.user);
 };
 export const clearAuth = () => {
   localStorage.removeItem("quizforge_token");
@@ -21,7 +25,9 @@ export async function api(path, options = {}) {
       const body = await response.json();
       message = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail);
     } catch { /* response was not JSON */ }
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    throw error;
   }
   if (response.status === 204) return null;
   return response.json();

@@ -77,4 +77,12 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(bear
     user = db.get(User, decode_user_id(credentials.credentials))
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+    if not user.is_active:
+        raise HTTPException(status_code=403, detail="This account has been suspended")
+    return user
+
+
+def current_admin(user: User = Depends(current_user)) -> User:
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Administrator access required")
     return user

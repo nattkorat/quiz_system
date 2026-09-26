@@ -38,6 +38,7 @@ CORS_ORIGINS = [origin.strip() for origin in required_env("CORS_ORIGINS").split(
 CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None
 ALLOW_PUBLIC_REGISTRATION = required_bool_env("ALLOW_PUBLIC_REGISTRATION")
 RESULT_DISPLAY_SECONDS = max(1, int(required_env("RESULT_DISPLAY_SECONDS")))
+MAX_PARTICIPANTS_PER_SESSION = max(1, int(os.getenv("MAX_PARTICIPANTS_PER_SESSION", "150")))
 PASSWORD_RESET_ENABLED = optional_bool_env("PASSWORD_RESET_ENABLED")
 PASSWORD_RESET_BASE_URL = os.getenv("PASSWORD_RESET_BASE_URL", "").strip().rstrip("/")
 PASSWORD_RESET_EXPIRE_MINUTES = max(5, int(os.getenv("PASSWORD_RESET_EXPIRE_MINUTES", "30")))

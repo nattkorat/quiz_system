@@ -23,6 +23,10 @@ class ResetPasswordIn(BaseModel):
     password: str = Field(min_length=8, max_length=128)
 
 
+class AdminUserUpdate(BaseModel):
+    is_active: bool
+
+
 class QuestionIn(BaseModel):
     text: str = Field(min_length=1, max_length=2000)
     type: str = "single"
@@ -83,6 +87,10 @@ class FolderIn(BaseModel):
 
 class FolderMemberIn(BaseModel):
     email: EmailStr
+
+
+class FolderInviteIn(BaseModel):
+    expires_at: datetime
 
 
 class JoinIn(BaseModel):
